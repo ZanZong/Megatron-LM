@@ -1,31 +1,22 @@
 #!/bin/bash
 
 set -x
-# if [ "$#" -ne 8 ]
-# then
-#     echo "usage:" $0 "exp_name model_name t p d gbs mbs nodelist"
-#     exit 1
-# fi
+if [ "$#" -ne 8 ]
+then
+    echo "usage:" $0 "exp_name model_name t p d gbs mbs nodelist"
+    exit 1
+fi
 
 export MASTER_PORT=$(expr $RANDOM % 10000 + 10000)
 
-# export EXP_NAME=$1
-# export MODEL_NAME=$2
-# export TENSOR_PARALLEL_SIZE=$3
-# export PIPELINE_PARALLEL_SIZE=$4
-# export DATA_PARALLEL_SIZE=$5
-# export GLOBAL_BATCH_SIZE=$6
-# export MICRO_BATCH_SIZE=$7
-# export NODELIST=$8
-# export GPUS_PER_NODE=8
-export EXP_NAME="test"
-export MODEL_NAME="GPT-1.3B"
-export TENSOR_PARALLEL_SIZE=2
-export PIPELINE_PARALLEL_SIZE=2
-export DATA_PARALLEL_SIZE=2
-export GLOBAL_BATCH_SIZE=64
-export MICRO_BATCH_SIZE=8
-export NODELIST=nico4
+export EXP_NAME=$1
+export MODEL_NAME=$2
+export TENSOR_PARALLEL_SIZE=$3
+export PIPELINE_PARALLEL_SIZE=$4
+export DATA_PARALLEL_SIZE=$5
+export GLOBAL_BATCH_SIZE=$6
+export MICRO_BATCH_SIZE=$7
+export NODELIST=$8
 export GPUS_PER_NODE=8
 
 export NUM_LAYERS=-1
@@ -63,7 +54,7 @@ mkdir -p $PROFILER_LOG_PATH
 
 NNODES=$(scontrol show hostnames ${NODELIST} | wc -l)
 
-srun \
+nohup srun \
     --exclusive=user \
     -p Big \
     -N $NNODES \
@@ -74,4 +65,4 @@ srun \
 	--ntasks-per-node=$GPUS_PER_NODE \
     --gres=gpu:$GPUS_PER_NODE \
     --export=ALL \
-	bash pretrain.sh
+	bash pretrain.sh  > ${LOG_DIR}/${LOG_NAME} 2>&1
