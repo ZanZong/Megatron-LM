@@ -15,9 +15,9 @@ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 source ~/workspace/mega-env/bin/activate
 cd /home/zanzong/workspace/Megatron-LM
 
-VOCAB_FILE=/mnt/zoltan/zanzong/fastmoe-dataset/wikidataset/gpt2-vocab.json
-MERGE_FILE=/mnt/zoltan/zanzong/fastmoe-dataset/wikidataset/gpt2-merges.txt
-DATA_PATH=/mnt/zoltan/zanzong/fastmoe-dataset/wikidataset/my-bert_text_sentence
+VOCAB_FILE=~/datasets/wikidataset/gpt2-vocab.json
+MERGE_FILE=~/datasets/wikidataset/gpt2-merges.txt
+DATA_PATH=~/datasets/wikidataset/my-bert_text_sentence
 
 # TRAIN_SAMPLES=$(( $GLOBAL_BATCH_SIZE * 50))
 TRAIN_SAMPLES=$(( $GLOBAL_BATCH_SIZE * 15))
