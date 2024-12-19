@@ -1430,10 +1430,15 @@ class ParallelTransformer(MegatronModule):
         self.microbatch_count = 0
         self.checkpoint_core_attention = config.recompute_granularity == 'selective'
 
-        # Number of layers.
-        self.num_layers = _get_num_layers(args, model_type,
-                                          layer_type==LayerType.decoder)
-
+        # If using hetero devices, the layer division should be imbalance.
+        imbalance_offset = None
+        if args.hetero_cluster:
+            self.num_layers = args.stage_layer_num[mpu.get_pipeline_model_parallel_rank()]
+            print(f"\nRank={torch.distributed.get_rank()}: get {self.num_layers} layers for stage {mpu.get_pipeline_model_parallel_rank()}", flush=True)
+        else:
+            self.num_layers = _get_num_layers(args, model_type,
+                                            layer_type==LayerType.decoder)
+        
         self.drop_path_rates = [
             rate.item() for rate in
             torch.linspace(0, self.drop_path_rate, config.num_layers)]
@@ -1457,6 +1462,7 @@ class ParallelTransformer(MegatronModule):
                 current_layer_type = _get_layer_type(
                     model_type, layer_type, self.retro_layer_numbers,
                     layer_number)
+                # print(f"build {layer_number}-th layer, total num_layer={config.num_layers}, current stage has {self.num_layers} layers", flush=True)
                 return ParallelTransformerLayer(
                     config,
                     layer_number,
@@ -1506,6 +1512,7 @@ class ParallelTransformer(MegatronModule):
                 'num_layers_per_stage must be divisible by ' \
                 'virtual_pipeline_model_parallel_size'
             assert args.model_type != ModelType.encoder_and_decoder
+            assert not args.hetero_cluster
             # Number of layers in each model chunk is the number of layers in the stage,
             # divided by the number of model chunks in a stage.
             self.num_layers = self.num_layers // config.virtual_pipeline_model_parallel_size
@@ -1522,16 +1529,19 @@ class ParallelTransformer(MegatronModule):
                 (mpu.get_pipeline_model_parallel_rank() * self.num_layers)
         else:
             # Each stage gets a contiguous set of layers.
-            if args.model_type == ModelType.encoder_and_decoder and \
-                    mpu.get_pipeline_model_parallel_world_size() > 1:
-                pipeline_rank = mpu.get_pipeline_model_parallel_rank()
-                if layer_type == LayerType.encoder:
-                    offset = pipeline_rank * self.num_layers
-                else:
-                    num_ranks_in_enc = args.pipeline_model_parallel_split_rank
-                    offset = (pipeline_rank - num_ranks_in_enc) * self.num_layers
+            if args.hetero_cluster:
+                offset = sum(args.stage_layer_num[:mpu.get_pipeline_model_parallel_rank()])
             else:
-                offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
+                if args.model_type == ModelType.encoder_and_decoder and \
+                        mpu.get_pipeline_model_parallel_world_size() > 1:
+                    pipeline_rank = mpu.get_pipeline_model_parallel_rank()
+                    if layer_type == LayerType.encoder:
+                        offset = pipeline_rank * self.num_layers
+                    else:
+                        num_ranks_in_enc = args.pipeline_model_parallel_split_rank
+                        offset = (pipeline_rank - num_ranks_in_enc) * self.num_layers
+                else:
+                    offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
 
         if self.num_layers == 0:
             # When a standalone embedding stage is used (e.g.,

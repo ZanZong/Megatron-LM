@@ -238,3 +238,23 @@ def print_rank_last(message):
             print(message, flush=True)
     else:
         print(message, flush=True)
+
+def print_hetero_device_memory():
+    """Print memory usage of the first pipeline stage of heterogeneous devices."""
+    rank_list_to_print = [0, 4]
+    if torch.distributed.is_initialized():
+        self_rank = torch.distributed.get_rank()
+        if self_rank in rank_list_to_print:
+            mega_bytes = 1024.0 * 1024.0
+            string = 'rank ' + str(mpu.get_data_parallel_rank()) + ' memory (MB)'
+            string += ' | allocated: {}'.format(
+                torch.cuda.memory_allocated() / mega_bytes)
+            string += ' | max allocated: {}'.format(
+                torch.cuda.max_memory_allocated() / mega_bytes)
+            string += ' | reserved: {}'.format(
+                torch.cuda.memory_reserved() / mega_bytes)
+            string += ' | max reserved: {}'.format(
+                torch.cuda.max_memory_reserved() / mega_bytes)
+            print(f"device type={mpu._HETERO_DEVICE_TYPES[self_rank]}, memory usage: {string}", flush=True)
+    else:
+        print(message, flush=True)

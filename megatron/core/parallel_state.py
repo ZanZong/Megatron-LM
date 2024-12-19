@@ -8,6 +8,7 @@ from typing import Optional
 import torch
 
 from .utils import GlobalMemoryBuffer
+from megatron import get_args
 
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
@@ -70,6 +71,9 @@ _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
+
+# The device type of all ordered ranks.
+_HETERO_DEVICE_TYPES = None
 
 
 def initialize_model_parallel(
@@ -425,7 +429,22 @@ def initialize_model_parallel(
     # put this. If we end up with a more generic initialization of megatron-core
     # we could stick it there
     _set_global_memory_buffer()
-
+    
+    # Get heterogeneous cluster info
+    self_device_type = int(os.environ.get('DEVICE_TYPE', None))
+    global _HETERO_DEVICE_TYPES
+    if self_device_type is not None:
+        self_device_type = torch.tensor([self_device_type], device=torch.cuda.current_device(), dtype=torch.int32)
+        all_device_types = [torch.zeros([1], device=torch.cuda.current_device(), dtype=torch.int32) for _ in range(world_size)]
+        torch.distributed.all_gather(all_device_types, self_device_type)
+        _HETERO_DEVICE_TYPES = list(t.tolist()[0] for t in all_device_types)
+        # Instrument arguments
+        args = get_args()
+        if args.hetero_cluster and args.stage_recompute_num_layers is not None:
+            args.recompute_num_layers = args.stage_recompute_num_layers[get_pipeline_model_parallel_rank()]
+            print(f"Recompute {args.recompute_num_layers} for stage {get_pipeline_model_parallel_rank()}")
+        print(f"device memory={torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory/1024/1024/1024}GB", flush=True)
+    print(f'_HETERO_DEVICE_TYPES={_HETERO_DEVICE_TYPES}', flush=True)
 
 def is_unitialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""

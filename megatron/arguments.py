@@ -384,7 +384,14 @@ def validate_args(args, defaults={}):
         if args.tensor_model_parallel_size > 1:
             assert args.sequence_parallel, \
                 "When using expert parallelism and tensor parallelism, sequence parallelism must be used."
-
+                
+    if args.hetero_cluster:
+        assert args.stage_layer_num is not None, "If training on heterogeneous cluster, manually specify the layer number of each stage."
+        print(f"get param. args.stage_layer_num={args.stage_layer_num}", flush=True)
+        assert len(args.stage_layer_num) == args.pipeline_model_parallel_size, "len of stage-layer-num must equal to pipeline-model-parallel-size"
+        if not hasattr(args, "stage_recompute_num_layers"):
+            args.stage_recompute_num_layers = None
+        
     # Print arguments.
     _print_args("arguments", args)
     retro_args = get_retro_args()
@@ -1071,6 +1078,13 @@ def _add_distributed_args(parser):
                        help='Use distributed optimizer.')
     group.add_argument('--expert-model-parallel-size', type=int, default=1,
                        help='Degree of expert model parallelism.')
+    group.add_argument('--hetero-cluster', type=bool, default=False, required=False,
+                       help='If set to True, the uneven pipeline division will be used.')
+    group.add_argument('--stage-layer-num', nargs='+', type=int, required=False,
+                       help='If hetero-cluster is set to True, the number of layers need to be specified.')
+    group.add_argument('--stage-recompute-num-layers', nargs='+', type=int, required=False,
+                       help='If using recompute and hetero-cluster is set to True, '
+                       'the number of recomputed layers is required.')
     return parser
 
 

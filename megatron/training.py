@@ -44,6 +44,7 @@ from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import finalize_model_grads, get_forward_backward_func
 from megatron.utils import report_memory
+from megatron.utils import print_hetero_device_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 
 
@@ -471,6 +472,9 @@ def train_step(forward_step_func, data_iterator,
             losses_reduced_for_key = [x[key] for x in losses_reduced]
             loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
         return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
+    # log memory for tuning
+    # print_hetero_device_memory()
+    
     return {}, skipped_iter, grad_norm, num_zeros_in_grad
 
 
@@ -638,6 +642,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             args.consumed_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0)
+        log_string += ' throughput (sample/s): {:.2f} |'.format(
+            batch_size / elapsed_time_per_iteration)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
         log_string += ' global batch size: {:5d} |'.format(batch_size)
         for key in total_loss_dict:

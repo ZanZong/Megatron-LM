@@ -9,6 +9,15 @@ export NODE_RANK=$(expr $SLURM_PROCID / $NNODES)
 export WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 export RANK=$SLURM_PROCID
 export CUDA_DEVICE_MAX_CONNECTIONS=1 # for async gradient all reduce
+hostname=$(hostname)
+if [ "$hostname" == "nico4" ]; then
+    export DEVICE_TYPE="0" # V100-32GB is denoted as 0
+elif [ "$hostname" == "zoltan" ]; then
+    export DEVICE_TYPE="1" # V100-16GB is denoted as 1
+else
+    echo "Unknown hostname: $hostname"
+    exit 1
+fi
 
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 
@@ -51,4 +60,9 @@ exec python \
         --adam-beta1 0.9 \
         --adam-beta2 0.95 \
         --init-method-std 0.002 \
-        --fp16
+        --fp16 \
+        --hetero-cluster True \
+        --stage-layer-num 2 2 2 2 4 4 4 4 \
+        --recompute-granularity full \
+        --recompute-method block \
+        --stage-recompute-num-layers 2 2 2 2 1 1 1 1

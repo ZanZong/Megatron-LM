@@ -18,14 +18,14 @@ export MASTER_PORT=$(expr $RANDOM % 10000 + 10000)
 # export MICRO_BATCH_SIZE=$7
 # export NODELIST=$8
 # export GPUS_PER_NODE=8
-export EXP_NAME="test"
-export MODEL_NAME="GPT-760M"
+export EXP_NAME="hetero-train"
+export MODEL_NAME="GPT-1.3B"
 export TENSOR_PARALLEL_SIZE=1
 export PIPELINE_PARALLEL_SIZE=8
-export DATA_PARALLEL_SIZE=2
-export GLOBAL_BATCH_SIZE=128
-export MICRO_BATCH_SIZE=4
-export NODELIST=nico[2-3]
+export DATA_PARALLEL_SIZE=1
+export GLOBAL_BATCH_SIZE=256
+export MICRO_BATCH_SIZE=8
+export NODELIST=nico4
 export GPUS_PER_NODE=8
 
 export NUM_LAYERS=-1
@@ -40,6 +40,12 @@ fi
 
 if [ ${MODEL_NAME} == "GPT-1.3B" ];then
     export NUM_LAYERS=24
+    export HIDDEN_SIZE=2048
+    export NUM_ATTN_HEADS=16
+fi
+
+if [ ${MODEL_NAME} == "GPT-1.7B" ];then
+    export NUM_LAYERS=32
     export HIDDEN_SIZE=2048
     export NUM_ATTN_HEADS=16
 fi
@@ -65,12 +71,12 @@ NNODES=$(scontrol show hostnames ${NODELIST} | wc -l)
 
 srun \
     --exclusive=user \
-    -p Big \
+    -p V100 \
     -N $NNODES \
     -K \
     -w $NODELIST \
     --time 20:00 \
-    --job-name=mmpret \
+    --job-name=$EXP_NAME \
 	--ntasks-per-node=$GPUS_PER_NODE \
     --gres=gpu:$GPUS_PER_NODE \
     --export=ALL \
