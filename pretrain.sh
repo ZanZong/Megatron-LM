@@ -10,14 +10,19 @@ export WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 export RANK=$SLURM_PROCID
 export CUDA_DEVICE_MAX_CONNECTIONS=1 # for async gradient all reduce
 hostname=$(hostname)
-if [ "$hostname" == "nico4" ]; then
-    export DEVICE_TYPE="0" # V100-32GB is denoted as 0
-elif [ "$hostname" == "zoltan" ]; then
-    export DEVICE_TYPE="1" # V100-16GB is denoted as 1
-else
-    echo "Unknown hostname: $hostname"
-    exit 1
-fi
+# if [ "$hostname" == "nico4" ]; then
+#    export DEVICE_TYPE="0" # V100-32GB is denoted as 0
+# elif [ "$hostname" == "zoltan" ]; then
+#    export DEVICE_TYPE="1" # V100-16GB is denoted as 1
+# else
+#    echo "Unknown hostname: $hostname"
+#    exit 1
+# fi
+
+
+export GLOO_SOCKET_IFNAME=eno1
+export NCCL_SOCKET_IFNAME=eno1
+export NCCL_IB_DISABLE=1
 
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 
@@ -29,7 +34,7 @@ MERGE_FILE=~/datasets/wikidataset/gpt2-merges.txt
 DATA_PATH=~/datasets/wikidataset/my-bert_text_sentence
 
 # TRAIN_SAMPLES=$(( $GLOBAL_BATCH_SIZE * 50))
-TRAIN_SAMPLES=$(( $GLOBAL_BATCH_SIZE * 15))
+TRAIN_SAMPLES=$(( $GLOBAL_BATCH_SIZE * 8))
 
 PROFILER_LOG_PATH=$PROFILER_LOG_PATH \
 exec python \
@@ -52,6 +57,7 @@ exec python \
         --min-lr 0.00001 \
         --lr-decay-style cosine \
         --log-interval 1 \
+        --timing-log-level 2 \
         --eval-iters -1 \
         --data-path ${DATA_PATH} \
         --split 100,0,0 \
@@ -61,8 +67,10 @@ exec python \
         --adam-beta2 0.95 \
         --init-method-std 0.002 \
         --fp16 \
+        --recompute-granularity selective \
         --hetero-cluster True \
-        --stage-layer-num 2 2 2 2 4 4 4 4 \
-        --recompute-granularity full \
-        --recompute-method block \
-        --stage-recompute-num-layers 2 2 2 2 1 1 1 1
+        --stage-layer-num 14 12 11 11 2 2 2 2 \
+        # --recompute-granularity full \
+        # --recompute-method block \
+        # --stage-recompute-num-layers 1 1 2 2
+

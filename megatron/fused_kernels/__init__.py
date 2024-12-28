@@ -30,7 +30,8 @@ def load(args):
 
     # Build path
     srcpath = pathlib.Path(__file__).parent.absolute()
-    buildpath = srcpath / "build"
+    # buildpath = srcpath / "build"
+    buildpath = "/home/zanzong/workspace/Megatron-LM/megatron/fused_kernels/build"
     _create_build_dir(buildpath)
 
     # Helper function to build the kernels.

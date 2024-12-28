@@ -388,9 +388,12 @@ def validate_args(args, defaults={}):
     if args.hetero_cluster:
         assert args.stage_layer_num is not None, "If training on heterogeneous cluster, manually specify the layer number of each stage."
         print(f"get param. args.stage_layer_num={args.stage_layer_num}", flush=True)
-        assert len(args.stage_layer_num) == args.pipeline_model_parallel_size, "len of stage-layer-num must equal to pipeline-model-parallel-size"
+        # assert len(args.stage_layer_num) == args.pipeline_model_parallel_size, "len of stage-layer-num must equal to pipeline-model-parallel-size"
         if not hasattr(args, "stage_recompute_num_layers"):
             args.stage_recompute_num_layers = None
+        if args.stage_dp_size is None:
+            args.stage_dp_size = [args.data_parallel_size for _ in range(args.pipeline_model_parallel_size)]
+        assert len(args.stage_dp_size) == len(args.stage_layer_num)
         
     # Print arguments.
     _print_args("arguments", args)
@@ -1082,6 +1085,8 @@ def _add_distributed_args(parser):
                        help='If set to True, the uneven pipeline division will be used.')
     group.add_argument('--stage-layer-num', nargs='+', type=int, required=False,
                        help='If hetero-cluster is set to True, the number of layers need to be specified.')
+    group.add_argument('--stage-dp-size', nargs='+', type=int, required=False,
+                       help='If hetero-cluster is set to True, the data parallel size of each stage. use data parallel size if not specified.')
     group.add_argument('--stage-recompute-num-layers', nargs='+', type=int, required=False,
                        help='If using recompute and hetero-cluster is set to True, '
                        'the number of recomputed layers is required.')

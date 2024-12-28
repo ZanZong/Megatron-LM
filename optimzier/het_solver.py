@@ -4,8 +4,6 @@ import math
 import os
 import numpy as np
 from typing import Dict, Any, Optional
-
-import numpy as np
 # noinspection PyPackageRequirements
 from gurobipy import GRB, Model, quicksum
 from profiler.performance_model import LayerWiseCostModel
@@ -161,6 +159,12 @@ def dist_points(start, stop, n, min_val=0.0):
     pts = sorted(start + np.arange(0, 1, 1. / n) * (stop - start))
     return [p for p in pts if p > min_val]
 
+def heurist_search():
+    # using heurists to explore partition setting:
+    # If sub-device mesh perform worse than existing sub-mesh 
+    #    with the same size, break this depth-first loop.
+    pass
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("GDTrainer")
@@ -168,34 +172,43 @@ if __name__ == "__main__":
     # args.batch_size = 32
     # args.model_name = 'gpt'
     from profiler.performance_model import DeviceTFOPS, DeviceType
-    device_type_map = {0: DeviceType.a100, 1: DeviceType.v100} # small index should be high-end device
+    device_type_map = {0: DeviceType.a100, 1: DeviceType.v100, 2: DeviceType.a10} # small index should be high-end device
     cluster_config = {
-        0: {'topo': [1, 8], "bandwidth": 32, "budget": 80},
-        1: {'topo': [1, 4], "bandwidth": 12, "budget": 32}
+        0: {'topo': [1, 4], "bandwidth": 12, "budget": 40},
+        1: {'topo': [1, 2], "bandwidth": 12, "budget": 16},
+        2: {'topo': [1, 2], "bandwidth": 12, "budget": 24},
     }
-    cross_cluster_bd = {(0, 1): 1} # GB/s
+    cross_cluster_bd = {(0, 1): 1, (1, 2): 16} # GB/s
     # Transformer configuraions.
-    llama2_7b = {
-        'sequence_length': 4096,
+    GPT_2_1B = {
+        'sequence_length': 1024,
+        'hidden_size': 4096,
+        'num_attention_heads': 32,
+        'layer_num': 10,
+        'vocab_size': 32000,
+        'batch_size': 4,
+    }
+    GPT_4_7B = {
+        'sequence_length': 1024,
+        'hidden_size': 4096,
+        'num_attention_heads': 32,
+        'layer_num': 24,
+        'vocab_size': 32000,
+        'batch_size': 4,
+    }
+    GPT_6_2B = {
+        'sequence_length': 1024,
         'hidden_size': 4096,
         'num_attention_heads': 32,
         'layer_num': 32,
         'vocab_size': 32000,
         'batch_size': 4,
     }
-    llama2_13b = {
-        'sequence_length': 4096,
-        'hidden_size': 5120,
-        'num_attention_heads': 40,
-        'layer_num': 40,
-        'vocab_size': 32000,
-        'batch_size': 4,
-    }
-    llama2_70b = {
-        'sequence_length': 4096,
-        'hidden_size': 8192,
-        'num_attention_heads': 64,
-        'layer_num': 40,
+    GPT_11B = {
+        'sequence_length': 1024,
+        'hidden_size': 4096,
+        'num_attention_heads': 32,
+        'layer_num': 56,
         'vocab_size': 32000,
         'batch_size': 4,
     }
@@ -203,10 +216,10 @@ if __name__ == "__main__":
     # Tunable partition method and micro-batch size.
     parts = {
         'tp': 1,
-        'pp': 12,
+        'pp': 8,
         'dp': 1,
     }
-    solve_ilp_gurobi(llama2_13b, cluster_config, device_type_map, cross_cluster_bd, parts)
+    solve_ilp_gurobi(GPT_11B, cluster_config, device_type_map, cross_cluster_bd, parts)
 
     
     

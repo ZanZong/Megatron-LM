@@ -173,6 +173,7 @@ def initialize_model_parallel(
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
+    args = get_args()
 
     if (
         world_size
@@ -227,6 +228,29 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
     assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
     all_data_parallel_group_ranks_with_cp = []
+    # if args.hetero_cluster:
+    #     assert tensor_model_parallel_size == 1, "currently only support dp+pp."
+    #     for i in range(len(args.stage_layer_num)):
+    #         start_rank = sum(args.stage_dp_size[:i])
+    #         end_rank = start_rank + args.stage_dp_size[i]
+    #         ranks = range(start_rank, end_rank)
+    #         group = torch.distributed.new_group(ranks)
+    #         group_gloo = torch.distributed.new_group(ranks, backend="gloo")
+    #         if rank in ranks:
+    #             _DATA_PARALLEL_GROUP = group
+    #             _DATA_PARALLEL_GROUP_GLOO = group_gloo
+    #             _DATA_PARALLEL_GLOBAL_RANKS = ranks
+    #             print(f"data parallel ranks={list(ranks)}")
+    #         for j in range(tensor_model_parallel_size):
+    #             ranks_with_cp = range(start_rank + j, end_rank, tensor_model_parallel_size)
+    #             all_data_parallel_group_ranks_with_cp.append(list(ranks_with_cp))
+    #             group_with_cp = torch.distributed.new_group(ranks_with_cp)
+    #             group_with_cp_gloo = torch.distributed.new_group(ranks_with_cp, backend="gloo")
+    #             if rank in ranks_with_cp:
+    #                 _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
+    #                 _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
+    #                 _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
+    # else:
     for i in range(pipeline_model_parallel_size):
         start_rank = i * num_pipeline_model_parallel_groups
         end_rank = (i + 1) * num_pipeline_model_parallel_groups
@@ -294,6 +318,9 @@ def initialize_model_parallel(
     # Build the model-parallel groups.
     global _MODEL_PARALLEL_GROUP
     assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
+    # if args.hetero_cluster:
+    #     pass
+    # else:
     for i in range(data_parallel_size * context_parallel_size):
         ranks = [
             data_parallel_group_ranks_with_cp[i]
@@ -327,6 +354,53 @@ def initialize_model_parallel(
     global _POSITION_EMBEDDING_GROUP
     global _POSITION_EMBEDDING_GLOBAL_RANKS
     assert _POSITION_EMBEDDING_GROUP is None, 'position embedding group is already initialized'
+    # if args.hetero_cluster:
+    #     num_het_pipeline = max(args.stage_dp_size)
+    #     assert num_het_pipeline <= 2, "more dp degree needs complex shuffling.[todo]"
+    #     step_index = [0 for _ in range(len(args.stage_layer_num))]
+    #     base_pipe = [0, 2, 4, 6, 7] # TODO
+    #     for i in range(num_het_pipeline):
+    #         ranks = []
+    #         for j in range(len(step_index)):
+    #             ranks.append(base_pipe[j] + step_index[j])
+    #             if step_index[j] < args.stage_dp_size[j] - 1:
+    #                 step_index[j] += 1
+    #         print(f"pipeline {i}: {ranks}")
+    #         group = torch.distributed.new_group(ranks)
+    #         if rank in ranks:
+    #             _PIPELINE_MODEL_PARALLEL_GROUP = group
+    #             _PIPELINE_GLOBAL_RANKS = ranks
+    #         # Keep below not changed.            
+    #         # Setup embedding group (to exchange gradients between
+    #         # first and last stages).
+    #         if len(ranks) > 1:
+    #             embedding_ranks = [ranks[0], ranks[-1]]
+    #             position_embedding_ranks = [ranks[0]]
+    #             if pipeline_model_parallel_split_rank is not None:
+    #                 if ranks[pipeline_model_parallel_split_rank] not in embedding_ranks:
+    #                     embedding_ranks = [
+    #                         ranks[0],
+    #                         ranks[pipeline_model_parallel_split_rank],
+    #                         ranks[-1],
+    #                     ]
+    #                 if ranks[pipeline_model_parallel_split_rank] not in position_embedding_ranks:
+    #                     position_embedding_ranks = [ranks[0], ranks[pipeline_model_parallel_split_rank]]
+    #         else:
+    #             embedding_ranks = ranks
+    #             position_embedding_ranks = ranks
+
+    #         group = torch.distributed.new_group(embedding_ranks)
+    #         if rank in embedding_ranks:
+    #             _EMBEDDING_GROUP = group
+    #         if rank in ranks:
+    #             _EMBEDDING_GLOBAL_RANKS = embedding_ranks
+
+    #         group = torch.distributed.new_group(position_embedding_ranks)
+    #         if rank in position_embedding_ranks:
+    #             _POSITION_EMBEDDING_GROUP = group
+    #         if rank in ranks:
+    #             _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
+    # else:
     for i in range(num_pipeline_model_parallel_groups):
         ranks = range(i, world_size, num_pipeline_model_parallel_groups)
         group = torch.distributed.new_group(ranks)
@@ -431,18 +505,17 @@ def initialize_model_parallel(
     _set_global_memory_buffer()
     
     # Get heterogeneous cluster info
-    self_device_type = int(os.environ.get('DEVICE_TYPE', None))
+    self_device_type = os.environ.get('DEVICE_TYPE', None)
     global _HETERO_DEVICE_TYPES
+    if args.hetero_cluster and args.stage_recompute_num_layers is not None:
+        args.recompute_num_layers = args.stage_recompute_num_layers[get_pipeline_model_parallel_rank()]
+        print(f"Recompute {args.recompute_num_layers} for stage {get_pipeline_model_parallel_rank()}")
     if self_device_type is not None:
+        self_device_type = int(self_device_type)
         self_device_type = torch.tensor([self_device_type], device=torch.cuda.current_device(), dtype=torch.int32)
         all_device_types = [torch.zeros([1], device=torch.cuda.current_device(), dtype=torch.int32) for _ in range(world_size)]
         torch.distributed.all_gather(all_device_types, self_device_type)
         _HETERO_DEVICE_TYPES = list(t.tolist()[0] for t in all_device_types)
-        # Instrument arguments
-        args = get_args()
-        if args.hetero_cluster and args.stage_recompute_num_layers is not None:
-            args.recompute_num_layers = args.stage_recompute_num_layers[get_pipeline_model_parallel_rank()]
-            print(f"Recompute {args.recompute_num_layers} for stage {get_pipeline_model_parallel_rank()}")
         print(f"device memory={torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory/1024/1024/1024}GB", flush=True)
     print(f'_HETERO_DEVICE_TYPES={_HETERO_DEVICE_TYPES}', flush=True)
 

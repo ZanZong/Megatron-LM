@@ -70,10 +70,12 @@ def flops_calculator(model_config):
 class DeviceType(Enum):
     a100 = "a100",
     v100 = "v100",
+    a10 = "a10",
     
 class DeviceTFOPS():
-    a100 = 312, # TFLOPS
+    a100 = 312, # TFLOPS fp16
     v100 = 125,
+    a10 = 125,
 
 class LayerWiseCostModel:
     """ Cost model for estimating execution time, communication time and memory costs.
