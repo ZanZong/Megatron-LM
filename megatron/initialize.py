@@ -167,6 +167,8 @@ def _initialize_distributed():
     args = get_args()
 
     device_count = torch.cuda.device_count()
+    print(f"get device count={device_count}, set to 4")
+    device_count = 4 # hard coding for gpu index issue
     if torch.distributed.is_initialized():
 
         if args.rank == 0:
@@ -185,6 +187,7 @@ def _initialize_distributed():
         # Manually set the device ids.
         if device_count > 0:
             device = args.rank % device_count
+            print(f"global rank={args.rank},device={device}", flush=True)
             if args.local_rank is not None:
                 assert (
                     args.local_rank == device

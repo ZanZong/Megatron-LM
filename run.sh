@@ -19,11 +19,11 @@ export MASTER_PORT=$(expr $RANDOM % 10000 + 10000)
 # export NODELIST=octave,twills
 # export GPUS_PER_NODE=4
 export EXP_NAME="hetero-train"
-export MODEL_NAME="GPT-11B"
+export MODEL_NAME="GPT-2.1B"
 export TENSOR_PARALLEL_SIZE=1
-export PIPELINE_PARALLEL_SIZE=8
-export DATA_PARALLEL_SIZE=1
-export GLOBAL_BATCH_SIZE=128
+export PIPELINE_PARALLEL_SIZE=2
+export DATA_PARALLEL_SIZE=4
+export GLOBAL_BATCH_SIZE=256
 export MICRO_BATCH_SIZE=1
 export NODELIST=octave,twills
 export GPUS_PER_NODE=4
@@ -88,15 +88,38 @@ mkdir -p $PROFILER_LOG_PATH
 
 NNODES=$(scontrol show hostnames ${NODELIST} | wc -l)
 
+# srun \
+#     -A long \
+#     -p long \
+#     -K \
+#     -N $NNODES \
+#     -w $NODELIST \
+#     --time 20:00 \
+#     --job-name=$EXP_NAME \
+# 	--ntasks-per-node=$GPUS_PER_NODE \
+#     --gres=gpu:$GPUS_PER_NODE \
+#     --export=ALL \
+# 	bash pretrain.sh
 srun \
     -A long \
     -p long \
     -K \
-    -N $NNODES \
-    -w $NODELIST \
+    -N 1 \
+    -w octave \
     --time 20:00 \
     --job-name=$EXP_NAME \
 	--ntasks-per-node=$GPUS_PER_NODE \
-    --gres=gpu:$GPUS_PER_NODE \
+    --gres=gpu:a100:4 \
     --export=ALL \
-	bash pretrain.sh
+	bash pretrain.sh : \
+    -A long \
+    -p long \
+    -K \
+    -N 1 \
+    -w twills \
+    --time 20:00 \
+    --job-name=$EXP_NAME \
+    --ntasks-per-node=$GPUS_PER_NODE \
+    --gres=gpu:v100:2,gpu:a10:2 \
+    --export=ALL \
+    bash pretrain.sh

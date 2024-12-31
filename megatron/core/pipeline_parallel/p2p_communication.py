@@ -235,7 +235,8 @@ def _communicate(
     recv_next: bool,
     tensor_shape: Shape,
     config: ModelParallelConfig,
-    wait_on_reqs: bool = True
+    wait_on_reqs: bool = True,
+    recv_dtype = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Communicate tensors between stages. Used as helper method in other
     communication methods that are used in megatron/schedules.py.
@@ -307,9 +308,9 @@ def _communicate(
             )
         tensor_recv_next = torch.empty(
             recv_next_shape,
-            requires_grad=True,
+            # requires_grad=True, # annotation for pp quantization
             device=torch.cuda.current_device(),
-            dtype=config.pipeline_dtype,
+            dtype=config.pipeline_dtype if recv_dtype is None else recv_dtype,
         )
 
     # Send tensors in both the forward and backward directions as appropriate.
@@ -365,14 +366,14 @@ def recv_forward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Tens
             recv_prev=True,
             recv_next=False,
             tensor_shape=tensor_shape,
-            config=config,
+            config=config
         )
         if config.timers is not None:
             config.timers('forward-recv').stop()
     return input_tensor
 
 
-def recv_backward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Tensor:
+def recv_backward(tensor_shape: Shape, config: ModelParallelConfig, recv_dtype=None) -> torch.Tensor:
     """Receive tensor from next rank in pipeline (backward receive).
 
     See _communicate for argument details.
@@ -389,6 +390,7 @@ def recv_backward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Ten
             recv_next=True,
             tensor_shape=tensor_shape,
             config=config,
+            recv_dtype=recv_dtype
         )
         if config.timers is not None:
             config.timers('backward-recv').stop()
@@ -437,7 +439,7 @@ def send_backward(input_tensor_grad: torch.Tensor, config: ModelParallelConfig) 
 
 
 def send_forward_recv_backward(
-    output_tensor: torch.Tensor, tensor_shape: Shape, config: ModelParallelConfig
+    output_tensor: torch.Tensor, tensor_shape: Shape, config: ModelParallelConfig, recv_dtype=None
 ) -> torch.Tensor:
     """Batched send and recv with next rank in pipeline.
 
@@ -455,6 +457,7 @@ def send_forward_recv_backward(
             recv_next=True,
             tensor_shape=tensor_shape,
             config=config,
+            recv_dtype=recv_dtype
         )
         if config.timers is not None:
             config.timers('forward-send-backward-recv').stop()

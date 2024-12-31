@@ -725,7 +725,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
     report_memory_flag = True
-
+    losses = []
     while iteration < args.train_iters:
         if args.profile and \
            iteration == args.profile_step_start and \
@@ -749,6 +749,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         # Logging.
         loss_scale = optimizer.get_loss_scale().item()
+        losses.append(loss_scale)
         params_norm = None
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
@@ -817,7 +818,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
            iteration == args.profile_step_end and \
            torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStop()
-
+    print_rank_0(f"All loss={losses}", flush=True)
     return iteration
 
 
