@@ -818,7 +818,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
            iteration == args.profile_step_end and \
            torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStop()
-    print_rank_0(f"All loss={losses}", flush=True)
+    print_rank_0(f"All loss={losses}")
     return iteration
 
 

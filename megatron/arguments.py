@@ -1090,6 +1090,8 @@ def _add_distributed_args(parser):
     group.add_argument('--stage-recompute-num-layers', nargs='+', type=int, required=False,
                        help='If using recompute and hetero-cluster is set to True, '
                        'the number of recomputed layers is required.')
+    group.add_argument('--enable-hetero-compression', type=int, default=0, required=False,
+                       help='If set to 1, inter-cluster grad will be compressed.')
     return parser
 
 

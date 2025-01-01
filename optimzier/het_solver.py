@@ -159,18 +159,22 @@ def dist_points(start, stop, n, min_val=0.0):
     pts = sorted(start + np.arange(0, 1, 1. / n) * (stop - start))
     return [p for p in pts if p > min_val]
 
-def heurist_search():
-    # using heurists to explore partition setting:
-    # If sub-device mesh perform worse than existing sub-mesh 
-    #    with the same size, break this depth-first loop.
-    pass
+def heurist_search(model_config, cluster_config, device_type_map, cross_cluster_bd, parts):
+    # Step 1: device sub-mesh composing
+    def gen_sub_mesh(array):
+        array = np.array(array)
+        sub_meshes = []
+        for div_t in range(int(np.sqrt(min(array))) + 1):
+            sub_meshes.append(array // pow(2, (div_t + 1)))
+        return sub_meshes
+    device_num_list = [mul(cluster_config[key]['topo']) for key in sorted(cluster_config.keys())]
+    sub_meshes = 
+    
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger("GDTrainer")
-    # args = extract_params()
-    # args.batch_size = 32
-    # args.model_name = 'gpt'
+    logger = logging.getLogger("GHPiper")
+    
     from profiler.performance_model import DeviceTFOPS, DeviceType
     device_type_map = {0: DeviceType.a100, 1: DeviceType.v100, 2: DeviceType.a10} # small index should be high-end device
     cluster_config = {
@@ -219,6 +223,7 @@ if __name__ == "__main__":
         'pp': 8,
         'dp': 1,
     }
+    
     solve_ilp_gurobi(GPT_11B, cluster_config, device_type_map, cross_cluster_bd, parts)
 
     

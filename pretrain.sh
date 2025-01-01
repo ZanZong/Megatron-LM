@@ -55,8 +55,8 @@ exec python \
         --global-batch-size $GLOBAL_BATCH_SIZE \
         --train-samples $TRAIN_SAMPLES \
 	--lr-decay-samples 4882800 \
-        --lr 0.0001 \
-        --min-lr 0.00001 \
+        --lr 0.00005 \
+        --min-lr 0.000005 \
         --lr-decay-style cosine \
         --log-interval 1 \
         --timing-log-level 2 \
@@ -70,8 +70,9 @@ exec python \
         --init-method-std 0.002 \
         --fp16 \
         --recompute-granularity selective \
-        # --hetero-cluster True \
-        # --stage-layer-num 10 3 3 2 1 1 2 2
+        --hetero-cluster True \
+        --enable-hetero-compression $COMPRESS \
+        --stage-layer-num $LL
         # --recompute-granularity full \
         # --recompute-method block \
         # --stage-recompute-num-layers 1 1 2 2

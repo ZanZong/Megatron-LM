@@ -2,10 +2,11 @@
 
 import contextlib
 from typing import Callable, Iterator, List, Optional, Union
-
+import math
 import torch
 from torch.autograd.variable import Variable
 
+from megatron import get_args
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
@@ -965,7 +966,7 @@ pre_guard_rank = 3 # hard coding for 8 stages
 post_guard_rank = 4 # hard coding for 8 stages
 enable_compression = False
 scale = None # scale factor which will be updated periodicity
-scale_update_periodic = 16
+scale_update_periodic = 8
 scale_counter = 0
 
 def quantize_3d(tensor, bits=8, signed=True):
@@ -990,8 +991,10 @@ def quantize_3d(tensor, bits=8, signed=True):
         min_val = 0
 
     # Compute the scale factor
-    scale = max_val / tensor.abs().max()
-
+    scale = max_val / torch.tensor(tensor.abs().max(), dtype=torch.float32)
+    # if scale < 0.00001:
+    #     scale = 0.00001
+    print(f"scale={scale}, max_val={max_val}, tensor.abs().max()={tensor.abs().max()}", flush=True)
     # Quantize the tensor
     quantized_tensor = (tensor * scale).round().clamp(min_val, max_val)
 
@@ -1040,14 +1043,18 @@ def recv_backward(tensor_shapes, config):
         if tensor_shape is None:
             output_tensor_grads.append(None)
         else:
+            global enable_compression
+            # print(f"recv_backward enable_compres={enable_compression}", flush=True)
             if enable_compression and pre_guard_rank == parallel_state.get_pipeline_model_parallel_rank():
                 recvd_grad = p2p_communication.recv_backward(tensor_shape, config, recv_dtype=torch.int8)
                 global scale_counter
+                # print(f"use int8 for grad tensor, scale_counter={scale_counter}", flush=True)
                 if scale_counter % scale_update_periodic == 0:
                     global scale
-                    scale = p2p_communication.recv_backward((1), config, recv_dtype=torch.float16)
-                    print(f"Rank {parallel_state.get_pipeline_model_parallel_rank()}, recv a scale={scale}")
+                    scale = p2p_communication.recv_backward((1), config, recv_dtype=torch.float32)
+                    print(f"Rank {parallel_state.get_pipeline_model_parallel_rank()}, recv a scale={scale}", flush=True)
                 scale_counter += 1
+                print(f"use scale={scale}", flush=True)
                 dq_grad = dequantize_3d(recvd_grad, scale)
                 # print(f"pp rank={pre_guard_rank}, scale={scale}, dq_grad={dq_grad}", flush=True)
                 output_tensor_grads.append(dq_grad)
@@ -1071,13 +1078,15 @@ def send_backward(input_tensor_grads, tensor_shapes, config):
     for (input_tensor_grad, tensor_shape) in zip(input_tensor_grads, tensor_shapes):
         if tensor_shape is None:
             continue
+        global enable_compression
         if enable_compression and post_guard_rank == parallel_state.get_pipeline_model_parallel_rank():
             qt, scale = quantize_3d(input_tensor_grad, bits=8)
             # print(f"pipeline rank={post_guard_rank}, send backward grad={input_tensor_grad}, convert to 8bits, get={qt}", flush=True)
-            scale_tensor = torch.tensor(scale, dtype=torch.float16)
+            scale_tensor = torch.tensor(scale, dtype=torch.float32)
             p2p_communication.send_backward(qt, config)
             global scale_counter
             if scale_counter % scale_update_periodic == 0:
+                # print(f"gen a scale_tensor={scale_tensor}", flush=True)
                 p2p_communication.send_backward(scale_tensor, config)
             scale_counter += 1
         else:
@@ -1092,15 +1101,19 @@ def send_forward_recv_backward(output_tensors, tensor_shapes, config):
         if tensor_shape is None:
             output_tensor_grads.append(None)
             continue
+        global enable_compression
         if enable_compression and pre_guard_rank == parallel_state.get_pipeline_model_parallel_rank():
             recvd_grad = p2p_communication.send_forward_recv_backward(
                 output_tensor, tensor_shape, config, recv_dtype=torch.int8
             )
             global scale_counter
+            # print(f"use int8 for grad tensor, scale_counter={scale_counter}", flush=True)
             if scale_counter % scale_update_periodic == 0:
                 global scale
-                scale = p2p_communication.recv_backward((1), config, recv_dtype=torch.float16)
+                scale = p2p_communication.recv_backward((1), config, recv_dtype=torch.float32)
+                # print(f"1F1B: recv a float32 scale={scale}", flush=True)
             scale_counter += 1
+            print(f"use scale={scale}", flush=True)
             dq_grad = dequantize_3d(recvd_grad, scale)
             output_tensor_grad = dq_grad
         else:
@@ -1119,15 +1132,17 @@ def send_backward_recv_forward(input_tensor_grads, tensor_shapes, config):
         if tensor_shape is None:
             input_tensors.append(None)
             continue
+        global enable_compression
         if enable_compression and post_guard_rank == parallel_state.get_pipeline_model_parallel_rank():
             qt, scale = quantize_3d(input_tensor_grad, bits=8)
-            scale_tensor = torch.tensor(scale, dtype=torch.float16)
+            scale_tensor = torch.tensor(scale, dtype=torch.float32)
             # print(f"pipeline rank={post_guard_rank}, send backward recv forward grad={input_tensor_grad}, convert to 8bits, get={qt}", flush=True)
             input_tensor = p2p_communication.send_backward_recv_forward(
                 qt, tensor_shape, config
             )
             global scale_counter
             if scale_counter % scale_update_periodic == 0:
+                print(f"gen a scale_tensor={scale_tensor}", flush=True)
                 p2p_communication.send_backward(scale_tensor, config)
             scale_counter += 1
         else:
@@ -1154,6 +1169,12 @@ def forward_backward_pipelining_without_interleaving(
     stages.
 
     Returns dictionary with losses if the last stage, empty dict otherwise."""
+    args = get_args()
+    if args.enable_hetero_compression == 1:
+        global enable_compression
+        enable_compression = True
+        global scale_counter
+        scale_counter = 0
 
     if isinstance(model, list):
         assert (
