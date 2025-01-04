@@ -168,7 +168,8 @@ def heurist_search(model_config, cluster_config, device_type_map, cross_cluster_
             sub_meshes.append(array // pow(2, (div_t + 1)))
         return sub_meshes
     device_num_list = [mul(cluster_config[key]['topo']) for key in sorted(cluster_config.keys())]
-    sub_meshes = 
+    sub_meshes = gen_sub_mesh(device_num_list)
+    # Step 2: optional tensor parallel
     
 
 if __name__ == "__main__":

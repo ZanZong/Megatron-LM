@@ -57,7 +57,7 @@ if [ ${MODEL_NAME} == "GPT-4.7B" ];then
     export NUM_LAYERS=24
     export HIDDEN_SIZE=4096
     export NUM_ATTN_HEADS=32
-    export LL="10 3 3 2 1 1 2 2"
+    export LL="7 4 4 3 1 1 2 2"
 fi
 
 if [ ${MODEL_NAME} == "GPT-6.2B" ];then

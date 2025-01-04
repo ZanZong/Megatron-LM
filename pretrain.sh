@@ -55,8 +55,8 @@ exec python \
         --global-batch-size $GLOBAL_BATCH_SIZE \
         --train-samples $TRAIN_SAMPLES \
 	--lr-decay-samples 4882800 \
-        --lr 0.00005 \
-        --min-lr 0.000005 \
+        --lr 0.0001 \
+        --min-lr 0.000001 \
         --lr-decay-style cosine \
         --log-interval 1 \
         --timing-log-level 2 \

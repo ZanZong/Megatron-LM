@@ -968,6 +968,7 @@ enable_compression = False
 scale = None # scale factor which will be updated periodicity
 scale_update_periodic = 8
 scale_counter = 0
+iteration_counter = 0
 
 def quantize_3d(tensor, bits=8, signed=True):
     """
@@ -990,12 +991,18 @@ def quantize_3d(tensor, bits=8, signed=True):
         max_val = 2 ** bits - 1         # e.g., 255 for 8-bit unsigned
         min_val = 0
 
-    # Compute the scale factor
-    scale = max_val / torch.tensor(tensor.abs().max(), dtype=torch.float32)
-    # if scale < 0.00001:
-    #     scale = 0.00001
-    print(f"scale={scale}, max_val={max_val}, tensor.abs().max()={tensor.abs().max()}", flush=True)
-    # Quantize the tensor
+    global iteration_counter
+    min_grad = tensor.abs().min() # It works! but why?
+    # min_grad = tensor.abs().mean()
+    if min_grad < 1E-5 and min_grad > 1E-6:
+        scaled_max_val = 1e-3
+        print(f"min_grad={min_grad}, use scaled_max_val={scaled_max_val}")
+    elif min_grad < 1E-6:
+        scaled_max_val = 1e-4
+        print(f"min_grad={min_grad}, use scaled_max_val={scaled_max_val}")
+    else:
+        scaled_max_val = max_val
+    scale = scaled_max_val / torch.tensor(tensor.abs().max(), dtype=torch.float32)
     quantized_tensor = (tensor * scale).round().clamp(min_val, max_val)
 
     # Convert to the appropriate data type
@@ -1018,6 +1025,7 @@ def dequantize_3d(quantized_tensor, scale):
         dequantized_tensor (torch.Tensor): Dequantized tensor.
     """
     # Convert to floating-point and dequantize
+    global iteration_counter
     dequantized_tensor = quantized_tensor.float() / scale
     return dequantized_tensor
 
@@ -1052,11 +1060,11 @@ def recv_backward(tensor_shapes, config):
                 if scale_counter % scale_update_periodic == 0:
                     global scale
                     scale = p2p_communication.recv_backward((1), config, recv_dtype=torch.float32)
-                    print(f"Rank {parallel_state.get_pipeline_model_parallel_rank()}, recv a scale={scale}", flush=True)
+                    # print(f"Rank {parallel_state.get_pipeline_model_parallel_rank()}, recv a scale={scale}", flush=True)
                 scale_counter += 1
-                print(f"use scale={scale}", flush=True)
+                # print(f"use scale={scale}", flush=True)
                 dq_grad = dequantize_3d(recvd_grad, scale)
-                # print(f"pp rank={pre_guard_rank}, scale={scale}, dq_grad={dq_grad}", flush=True)
+                print(f"pp rank={pre_guard_rank}, scale={scale}, dq_grad={dq_grad}", flush=True)
                 output_tensor_grads.append(dq_grad)
             else:
                 output_tensor_grads.append(p2p_communication.recv_backward(tensor_shape, config))
@@ -1081,8 +1089,9 @@ def send_backward(input_tensor_grads, tensor_shapes, config):
         global enable_compression
         if enable_compression and post_guard_rank == parallel_state.get_pipeline_model_parallel_rank():
             qt, scale = quantize_3d(input_tensor_grad, bits=8)
+            print(f"pipeline rank={post_guard_rank}, send backward grad={input_tensor_grad}, convert to 8bits, get={qt}", flush=True)
             # print(f"pipeline rank={post_guard_rank}, send backward grad={input_tensor_grad}, convert to 8bits, get={qt}", flush=True)
-            scale_tensor = torch.tensor(scale, dtype=torch.float32)
+            scale_tensor = torch.tensor(scale, dtype=torch.float32).to('cuda')
             p2p_communication.send_backward(qt, config)
             global scale_counter
             if scale_counter % scale_update_periodic == 0:
@@ -1113,7 +1122,7 @@ def send_forward_recv_backward(output_tensors, tensor_shapes, config):
                 scale = p2p_communication.recv_backward((1), config, recv_dtype=torch.float32)
                 # print(f"1F1B: recv a float32 scale={scale}", flush=True)
             scale_counter += 1
-            print(f"use scale={scale}", flush=True)
+            # print(f"use scale={scale}", flush=True)
             dq_grad = dequantize_3d(recvd_grad, scale)
             output_tensor_grad = dq_grad
         else:
@@ -1135,7 +1144,7 @@ def send_backward_recv_forward(input_tensor_grads, tensor_shapes, config):
         global enable_compression
         if enable_compression and post_guard_rank == parallel_state.get_pipeline_model_parallel_rank():
             qt, scale = quantize_3d(input_tensor_grad, bits=8)
-            scale_tensor = torch.tensor(scale, dtype=torch.float32)
+            scale_tensor = torch.tensor(scale, dtype=torch.float32).to('cuda')
             # print(f"pipeline rank={post_guard_rank}, send backward recv forward grad={input_tensor_grad}, convert to 8bits, get={qt}", flush=True)
             input_tensor = p2p_communication.send_backward_recv_forward(
                 qt, tensor_shape, config
@@ -1175,6 +1184,19 @@ def forward_backward_pipelining_without_interleaving(
         enable_compression = True
         global scale_counter
         scale_counter = 0
+        global scale_update_periodic
+        global iteration_counter
+        if iteration_counter > 50:
+            scale_update_periodic == 1
+        # if iteration_counter < 60:
+        #     pass
+        # elif iteration_counter >= 50 and iteration_counter < 90:
+        #     if iteration_counter % 4 == 0:
+        #         enable_compression = False
+        # elif iteration_counter >= 90:
+        #     if iteration_counter % 2 == 0:
+        #         enable_compression = False
+        iteration_counter += 1
 
     if isinstance(model, list):
         assert (
