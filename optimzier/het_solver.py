@@ -2,11 +2,14 @@ from enum import Enum
 import logging
 import math
 import os
+import time
 import numpy as np
+import copy
 from typing import Dict, Any, Optional
 # noinspection PyPackageRequirements
 from gurobipy import GRB, Model, quicksum
 from profiler.performance_model import LayerWiseCostModel
+import itertools
 
 def mul(tup):
         return tup[0] * tup[1]
@@ -18,6 +21,7 @@ class ILPSolver:
         self.layer_num = model_config["layer_num"]
         self.cost_model = LayerWiseCostModel(model_configs=model_config, bandwidth=10E9)
         self.m = Model("hetero_parallel_opt_l{}".format(self.layer_num))
+        self.m.setParam('OutputFlag', 0)
         if gurobi_params is not None:
             for k, v in gurobi_params.items():
                 setattr(self.m.Params, k, v)
@@ -32,11 +36,11 @@ class ILPSolver:
         self.cross_cluster_bd = cross_cluster_bd
         cluster_devices = [mul(self.het_cluster[key]['topo']) for key in self.het_cluster.keys()]
         self.shape = (sum(cluster_devices), self.layer_num)
-        print(f"device number for each cluster {cluster_devices}")
+        print(f"Modeling device num of each cluster: {cluster_devices}")
         self.S = self.m.addVars(self.shape[0], self.layer_num, name="S", vtype=GRB.BINARY) # rep. layer distribution
         
     
-    def build_model(self, part):
+    def build_model(self, tp_size):
         # seed solver with a baseline strategy
         # for x in range(self.shape[0]):
         #     for y in range(self.shape[1]):
@@ -44,7 +48,6 @@ class ILPSolver:
         # self.m.update()
         
         #  define objective function
-        tp_size = part["tp"]
         per_device_comp_time = [self.cost_model.get_compute_cost(self.device_types[i], "f") / tp_size for i in range(self.shape[0])]
         per_layer_mem_cost, per_layer_output_size = self.cost_model.get_memory_cost(tp_size, recompute=True)
         tp_cost = []
@@ -102,7 +105,7 @@ class ILPSolver:
         return s_out, p_out
 
 
-def solve_ilp_gurobi(model_config, cluster_config, device_type_map, cross_cluster_bd, part):
+def solve_ilp_gurobi(model_config, cluster_config, device_type_map, cross_cluster_bd, tp_size):
     """
     Memory-accurate solver with garbage collection.
     :param g: DFGraph -- graph definition extracted from model
@@ -116,16 +119,16 @@ def solve_ilp_gurobi(model_config, cluster_config, device_type_map, cross_cluste
                   'Presolve': 2,
                   'StartNodeLimit': 10000000}
     ilpsolver = ILPSolver(model_config, cluster_config, device_type_map, cross_cluster_bd)
-    ilpsolver.build_model(part)
+    ilpsolver.build_model(tp_size)
     try:
         s_out, p_out = ilpsolver.solve()
-        print(f"Solved S = \n{s_out}\n")
+        # print(f"Solved S = \n{s_out}\n")
         # print(f"Solved P\n = {p_out}\n")
-        ilp_feasible = True
+        # return estimated final e2e time
+        return 1
     except ValueError as e:
         print(e)
-        ilp_feasible = False
-    return None
+        return None
 
 
 np.set_printoptions(threshold=np.inf)
@@ -159,31 +162,91 @@ def dist_points(start, stop, n, min_val=0.0):
     pts = sorted(start + np.arange(0, 1, 1. / n) * (stop - start))
     return [p for p in pts if p > min_val]
 
-def heurist_search(model_config, cluster_config, device_type_map, cross_cluster_bd, parts):
-    # Step 1: device sub-mesh composing
-    def gen_sub_mesh(array):
-        array = np.array(array)
-        sub_meshes = []
-        for div_t in range(int(np.sqrt(min(array))) + 1):
-            sub_meshes.append(array // pow(2, (div_t + 1)))
-        return sub_meshes
-    device_num_list = [mul(cluster_config[key]['topo']) for key in sorted(cluster_config.keys())]
-    sub_meshes = gen_sub_mesh(device_num_list)
-    # Step 2: optional tensor parallel
+
+def heurist_search(model_config, cluster_config, device_type_map, cross_cluster_bd):
+    def decompose_power_of_two(n):
+        # 找到 n 的指数
+        exponent = int(n).bit_length() - 1
+        sub_topo = []
+        # 将指数分解为两个数的和
+        for i in range(1, exponent):
+            n_node = pow(2, i)
+            n_gpu_per_node = pow(2, exponent - i)
+            if n_gpu_per_node > 8:
+                continue
+            sub_topo.append((n_node, n_gpu_per_node))
+        return sub_topo
     
+    def gen_sub_mesh(device_num_list):
+        device_num_list = np.array(device_num_list)
+        sub_meshes = []
+        for dev_num in device_num_list:
+            sub_meshes.append(decompose_power_of_two(dev_num))
+        return sub_meshes
+    
+    # Pruning rules
+    # 1. if a dp size will cause OOM, skip larger dp sizes
+    # 2. for a dp setting, if larger tp will break, skip smaller tp
+    # 3. if smaller tp will increase latency, skip
+    enable_pruning = True
+        
+    # Step 1: device sub-mesh composing
+    device_num_list = np.array([mul(cluster_config[key]['topo']) for key in sorted(cluster_config.keys())])
+    # Step 2: optional tensor parallel
+    tp_sizes = [8, 4, 2, 1]
+    cache = {}
+    cout = 0
+    curr_index = None
+    for i in range(int(min(device_num_list)).bit_length()):
+        optional_dp_size = pow(2, i)
+        print(f"optional_dp_size={optional_dp_size}")
+        if enable_pruning and curr_index is not None:
+            if curr_index[1] == optional_dp_size and cache[curr_index] is None:
+                print("skip this dp loop")
+                continue
+        mp_mesh = device_num_list // optional_dp_size
+        sub_meshes = gen_sub_mesh(mp_mesh)
+        # print(f"gen_sub_mesh, mp device_num_list={mp_mesh}, get={sub_meshes}")
+        combinations = list(itertools.product(*sub_meshes))
+        # print(combinations)
+        for sub_mesh in combinations:
+            sub_cluster = copy.copy(cluster_config)
+            for j in sub_cluster.keys():
+                sub_cluster[j]["topo"] = sub_mesh[j]
+            for tp in tp_sizes:
+                if tp > min([sub_cluster[cl]['topo'][1] for cl in sub_cluster.keys()]):
+                    continue
+                if enable_pruning and curr_index is not None:
+                    if tp < curr_index[0] and cache[curr_index] is None:
+                        print("skip this tp loop")
+                        continue
+                print(f"valid config: tp={tp}, dp={optional_dp_size}, sub_cluster={sub_cluster}")
+                res = solve_ilp_gurobi(model_config, sub_cluster, device_type_map, cross_cluster_bd, tp)
+                if enable_pruning:
+                    curr_index = (tp, optional_dp_size, str([sub_cluster[key]['topo'] for key in sorted(sub_cluster.keys())]))
+                    cache[curr_index] = res
+                cout += 1
+    print(f"total combination={cout}")
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("GHPiper")
     
     from profiler.performance_model import DeviceTFOPS, DeviceType
-    device_type_map = {0: DeviceType.a100, 1: DeviceType.v100, 2: DeviceType.a10} # small index should be high-end device
+    device_type_map = {0: DeviceType.a100, 1: DeviceType.v100, 2: DeviceType.a10, 3: DeviceType.a10} # small index should be high-end device
+    # octave
+    # cluster_config = {
+    #     0: {'topo': [1, 4], "bandwidth": 12, "budget": 40},
+    #     1: {'topo': [1, 2], "bandwidth": 12, "budget": 16},
+    #     2: {'topo': [1, 2], "bandwidth": 12, "budget": 24},
+    # }
     cluster_config = {
-        0: {'topo': [1, 4], "bandwidth": 12, "budget": 40},
-        1: {'topo': [1, 2], "bandwidth": 12, "budget": 16},
-        2: {'topo': [1, 2], "bandwidth": 12, "budget": 24},
+        0: {'topo': [4, 8], "bandwidth": 12, "budget": 40},
+        1: {'topo': [4, 8], "bandwidth": 12, "budget": 24},
+        2: {'topo': [4, 8], "bandwidth": 12, "budget": 24},
+        3: {'topo': [4, 8], "bandwidth": 12, "budget": 24},
     }
-    cross_cluster_bd = {(0, 1): 1, (1, 2): 16} # GB/s
+    cross_cluster_bd = {(0, 1): 16, (1, 2): 1, (2, 3): 16} # GB/s
     # Transformer configuraions.
     GPT_2_1B = {
         'sequence_length': 1024,
@@ -225,7 +288,9 @@ if __name__ == "__main__":
         'dp': 1,
     }
     
-    solve_ilp_gurobi(GPT_11B, cluster_config, device_type_map, cross_cluster_bd, parts)
-
+    t_start = time.time()
+    heurist_search(GPT_11B, cluster_config, device_type_map, cross_cluster_bd)
+    t_end = time.time()
+    print(f"time cost={t_end - t_start}")
     
     
