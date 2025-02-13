@@ -54,10 +54,13 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+    print(f"get from env args.world_size={args.world_size}")
 
     return args
 
 def validate_args(args, defaults={}):
+    # Skip check because of the flexible pipeline
+    """
     # Tensor model parallel size.
     args.tensor_model_parallel_size = min(
         args.tensor_model_parallel_size, args.world_size)
@@ -94,7 +97,14 @@ def validate_args(args, defaults={}):
                     args.pipeline_model_parallel_size, 'split rank needs'\
                     ' to be less than pipeline model parallel size ({})'.format(
                             args.pipeline_model_parallel_size)
-
+    """
+    # TODO auto configure this through config file.
+    args.tensor_model_parallel_size = 1
+    args.data_parallel_size = 2 # with partial inner data parallel
+    args.pipeline_model_parallel_size = 2
+    args.transformer_pipeline_model_parallel_size = args.pipeline_model_parallel_size
+    args.world_size = 8
+    
     # Deprecated arguments
     assert args.batch_size is None, '--batch-size argument is no longer ' \
         'valid, use --micro-batch-size instead'
@@ -391,9 +401,9 @@ def validate_args(args, defaults={}):
         # assert len(args.stage_layer_num) == args.pipeline_model_parallel_size, "len of stage-layer-num must equal to pipeline-model-parallel-size"
         if not hasattr(args, "stage_recompute_num_layers"):
             args.stage_recompute_num_layers = None
-        if args.stage_dp_size is None:
-            args.stage_dp_size = [args.data_parallel_size for _ in range(args.pipeline_model_parallel_size)]
-        assert len(args.stage_dp_size) == len(args.stage_layer_num)
+        # if args.stage_dp_size is None:
+        #     args.stage_dp_size = [args.data_parallel_size for _ in range(args.pipeline_model_parallel_size)]
+        # assert len(args.stage_dp_size) == len(args.stage_layer_num)
         
     # Print arguments.
     _print_args("arguments", args)

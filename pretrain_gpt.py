@@ -20,6 +20,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
 from megatron.arguments import core_transformer_config_from_args
+from megatron.core import parallel_state
 # from megatron.core.models.gpt.gpt_layer_specs import (
 #     gpt_layer_with_transformer_engine_spec,
 #     gpt_layer_with_transformer_engine_spec_moe
@@ -98,6 +99,23 @@ def get_batch(data_iterator):
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
 
+    if parallel_state.is_pipeline_last_stage():
+        # shard data according to dependency
+        g = args.pipe_graph[parallel_state.get_pipeline_model_parallel_group_id()]
+        pred = [pred for pred in g.predecessors(torch.distributed.get_rank())][0]
+        shard_ranks = [_ for _ in g.successors(pred)]
+        shard_index = shard_ranks.index(torch.distributed.get_rank())
+        # sharded_batch_size = g[pred][torch.distributed.get_rank()]["weight"]
+        shard_num = len(shard_ranks)
+        shard_index = shard_index
+        print(f"get_batch tokens shape={tokens.shape}, labels shape={labels.shape}", flush=True)
+        if shard_num > 1:
+            sharded_tokens = torch.chunk(tokens, shard_num, dim=0)
+            tokens = sharded_tokens[shard_index]
+            sharded_labels = torch.chunk(labels, shard_num, dim=0)
+            labels = sharded_labels[shard_index]
+            print(f"after sharded tokens shape={tokens.shape}, labels shape={labels.shape}", flush=True)
+    
     # Get the masks and postition ids.
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
         tokens,
@@ -115,12 +133,12 @@ def loss_func(loss_mask: Tensor, output_tensor: Tensor):
         loss_mask (Tensor): Used to mask out some portions of the loss
         output_tensor (Tensor): The tensor with the losses
     """    
+    args = get_args()
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
-    args = get_args()
     if args.check_for_nan_in_loss_and_grad:
         global_rank = torch.distributed.get_rank()
         assert not loss.isnan(), (

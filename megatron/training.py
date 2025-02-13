@@ -43,6 +43,7 @@ from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import finalize_model_grads, get_forward_backward_func
+from megatron.core.pipeline_parallel import sharded_schedules
 from megatron.utils import report_memory
 from megatron.utils import print_hetero_device_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
@@ -417,7 +418,8 @@ def train_step(forward_step_func, data_iterator,
     optimizer.zero_grad()
 
     # Forward pass.
-    forward_backward_func = get_forward_backward_func()
+    # forward_backward_func = get_forward_backward_func()
+    forward_backward_func = sharded_schedules.get_forward_backward_func()
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=data_iterator,

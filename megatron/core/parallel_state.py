@@ -6,6 +6,7 @@ import os
 from typing import Optional
 
 import torch
+import networkx as nx
 
 from .utils import GlobalMemoryBuffer
 from megatron import get_args
@@ -174,350 +175,525 @@ def initialize_model_parallel(
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
     args = get_args()
-
-    if (
-        world_size
-        % (tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size)
-        != 0
-    ):
-        raise RuntimeError(
-            f"world_size ({world_size}) is not divisible by tensor_model_parallel_size "
-            f"({tensor_model_parallel_size}) x pipeline_model_parallel_size ({pipeline_model_parallel_size}) "
-            f"x context_parallel_size ({context_parallel_size})"
-        )
-
-    data_parallel_size: int = world_size // (
-        tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size
-    )
-
-    if data_parallel_size % expert_model_parallel_size != 0:
-        raise RuntimeError(
-            f"data_parallel_size ({data_parallel_size}) is not divisible by expert_model_parallel_size "
-        )
-
-    if expert_model_parallel_size > 1 and context_parallel_size > 1:
-        raise RuntimeError(
-            f"combination of expert model prallellism and context parallelism is not supported"
-        )
-
-    num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
-    num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
-
-    if virtual_pipeline_model_parallel_size is not None:
-        if not pipeline_model_parallel_size > 2:
-            raise RuntimeError(
-                "pipeline-model-parallel size should be greater than 2 with interleaved schedule"
-            )
-        global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
-        global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
-        _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = 0
-        _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = virtual_pipeline_model_parallel_size
-
-    if pipeline_model_parallel_split_rank is not None:
-        global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
-        _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = pipeline_model_parallel_split_rank
-
-    rank = torch.distributed.get_rank()
-
-    # Build the data-parallel groups.
+    # generate this config through parallelism degree?
+    parallel_group_config = {
+        "tp": [[0], [1], [2], [3], [4], [5], [6], [7]],
+        "cp": [[0], [1], [2], [3], [4], [5], [6], [7]],
+        "dp": [[0, 1], [2, 3, 4, 5, 6, 7]],
+        "pp": [[0, 2, 3, 4], [1, 5, 6, 7]],
+    }
+    pipe_deps = [[(0, 2), (0, 3), (0, 4)], [(1, 5), (1, 6), (1, 7)]]
+    args.parallel_group_config = parallel_group_config
+    print("call parallel state init", flush=True)
+    # graph analyze
+    pipe_graph = []
+    pipe_depth = []
+    for deps in pipe_deps:
+        devices = sorted(list({device for tup in deps for device in tup}))
+        device_list = sorted(list(devices))
+        g = nx.DiGraph()
+        g.add_nodes_from(device_list)
+        g.add_edges_from(deps)
+        depth = {node: 0 for node in devices}
+        for node in nx.topological_sort(g):
+            if node < 0:
+                break
+            for succ in g.successors(node):
+                depth[succ] = max(depth[succ], depth[node] + 1)
+        # virtual node and edge for input data
+        g.add_node(-1)
+        for node, dep in depth.items():
+            if dep == 0:
+                g.add_edge(-1, node)
+        pipe_graph.append(g)
+        pipe_depth.append(depth)
+    args.pipe_depth = pipe_depth
+    print(f"args.pipe_depth={args.pipe_depth}\n\n", flush=True)
+    args.pipe_graph = pipe_graph
+    init_group_from_config = True
+    set_micro_batch_dp_dispatcher(args.pipe_graph[0], args.pipe_depth[0], 9)    
+    set_micro_batch_dp_dispatcher(args.pipe_graph[1], args.pipe_depth[1], 9)
+    
     global _DATA_PARALLEL_GROUP
     global _DATA_PARALLEL_GROUP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS
     global _DATA_PARALLEL_GROUP_WITH_CP
     global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
-    assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
-    all_data_parallel_group_ranks_with_cp = []
-    # if args.hetero_cluster:
-    #     assert tensor_model_parallel_size == 1, "currently only support dp+pp."
-    #     for i in range(len(args.stage_layer_num)):
-    #         start_rank = sum(args.stage_dp_size[:i])
-    #         end_rank = start_rank + args.stage_dp_size[i]
-    #         ranks = range(start_rank, end_rank)
-    #         group = torch.distributed.new_group(ranks)
-    #         group_gloo = torch.distributed.new_group(ranks, backend="gloo")
-    #         if rank in ranks:
-    #             _DATA_PARALLEL_GROUP = group
-    #             _DATA_PARALLEL_GROUP_GLOO = group_gloo
-    #             _DATA_PARALLEL_GLOBAL_RANKS = ranks
-    #             print(f"data parallel ranks={list(ranks)}")
-    #         for j in range(tensor_model_parallel_size):
-    #             ranks_with_cp = range(start_rank + j, end_rank, tensor_model_parallel_size)
-    #             all_data_parallel_group_ranks_with_cp.append(list(ranks_with_cp))
-    #             group_with_cp = torch.distributed.new_group(ranks_with_cp)
-    #             group_with_cp_gloo = torch.distributed.new_group(ranks_with_cp, backend="gloo")
-    #             if rank in ranks_with_cp:
-    #                 _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
-    #                 _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
-    #                 _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
-    # else:
-    for i in range(pipeline_model_parallel_size):
-        start_rank = i * num_pipeline_model_parallel_groups
-        end_rank = (i + 1) * num_pipeline_model_parallel_groups
-        for j in range(context_parallel_size * tensor_model_parallel_size):
-            ranks = range(
-                start_rank + j, end_rank, context_parallel_size * tensor_model_parallel_size
-            )
+    global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
+    global _CONTEXT_PARALLEL_GROUP
+    global _CONTEXT_PARALLEL_GLOBAL_RANKS
+    global _TENSOR_MODEL_PARALLEL_GROUP
+    global _MODEL_PARALLEL_GROUP
+    global _PIPELINE_MODEL_PARALLEL_GROUP
+    global _PIPELINE_GLOBAL_RANKS
+    global _EMBEDDING_GROUP
+    global _EMBEDDING_GLOBAL_RANKS
+    global _POSITION_EMBEDDING_GROUP
+    global _POSITION_EMBEDDING_GLOBAL_RANKS
+    global _TENSOR_AND_DATA_PARALLEL_GROUP
+    global _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
+    global _TENSOR_AND_EXPERT_PARALLEL_GROUP
+    global _DATA_MODULO_EXPERT_PARALLEL_GROUP
+    
+    if init_group_from_config:
+
+        if virtual_pipeline_model_parallel_size is not None:
+            raise RuntimeError("virtual pipeline model paralllel is to be supported.")
+        num_tensor_model_parallel_groups = len(parallel_group_config["tp"])
+        num_pipeline_model_parallel_groups = len(parallel_group_config["pp"])
+        
+        if pipeline_model_parallel_split_rank is not None:
+            _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = pipeline_model_parallel_split_rank
+
+        rank = torch.distributed.get_rank()
+
+        # Build the data-parallel groups.
+        assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
+        all_data_parallel_group_ranks_with_cp = []
+        
+        for ranks in parallel_group_config["dp"]:
             group = torch.distributed.new_group(ranks)
             group_gloo = torch.distributed.new_group(ranks, backend="gloo")
             if rank in ranks:
                 _DATA_PARALLEL_GROUP = group
                 _DATA_PARALLEL_GROUP_GLOO = group_gloo
                 _DATA_PARALLEL_GLOBAL_RANKS = ranks
-        for j in range(tensor_model_parallel_size):
-            ranks_with_cp = range(start_rank + j, end_rank, tensor_model_parallel_size)
-            all_data_parallel_group_ranks_with_cp.append(list(ranks_with_cp))
-            group_with_cp = torch.distributed.new_group(ranks_with_cp)
-            group_with_cp_gloo = torch.distributed.new_group(ranks_with_cp, backend="gloo")
-            if rank in ranks_with_cp:
-                _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
-                _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
-                _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
-
-    # Apply SHARP to DP process groups
-    if use_sharp:
-        if rank == 0:
-            print(
-                "The number of process groups to use SHARP with depends on the type "
-                "of the network switch. Nvidia QM1 switch supports SAHRP up to 8 "
-                "process groups and QM2 supports up to 256 process groups. We apply "
-                "SHARP to the communications of the data-parallel domain. If the "
-                "number of data-parallel process groups is larger than the max "
-                "process groups that the network switch supports, the communication "
-                "will fall back to non-SHARP operators. To enable SHARP, "
-                "`#SBATCH_NETWORK=sharp` should be set in the sbatch script."
-            )
-        torch.distributed.barrier(
-            group=get_data_parallel_group(with_context_parallel=context_parallel_size > 1),
-            device_ids=[torch.cuda.current_device()],
-        )
-        # Set `NCCL_SHARP_DISABLE=1` to restrict SHARP application to DP process groups
-        os.environ["NCCL_SHARP_DISABLE"] = "1"
-
-    # Build the context-parallel groups.
-    global _CONTEXT_PARALLEL_GROUP
-    global _CONTEXT_PARALLEL_GLOBAL_RANKS
-    assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
-    for i in range(pipeline_model_parallel_size):
-        for j in range(data_parallel_size):
-            start_rank = (
-                i * num_pipeline_model_parallel_groups
-                + j * tensor_model_parallel_size * context_parallel_size
-            )
-            end_rank = (
-                i * num_pipeline_model_parallel_groups
-                + (j + 1) * tensor_model_parallel_size * context_parallel_size
-            )
-            for k in range(tensor_model_parallel_size):
-                ranks = range(start_rank + k, end_rank, tensor_model_parallel_size)
-                group = torch.distributed.new_group(ranks)
-                if rank in ranks:
-                    _CONTEXT_PARALLEL_GROUP = group
-                    _CONTEXT_PARALLEL_GLOBAL_RANKS = ranks
-
-    # Build the model-parallel groups.
-    global _MODEL_PARALLEL_GROUP
-    assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
-    # if args.hetero_cluster:
-    #     pass
-    # else:
-    for i in range(data_parallel_size * context_parallel_size):
-        ranks = [
-            data_parallel_group_ranks_with_cp[i]
-            for data_parallel_group_ranks_with_cp in all_data_parallel_group_ranks_with_cp
-        ]
-        group = torch.distributed.new_group(ranks)
-        if rank in ranks:
-            _MODEL_PARALLEL_GROUP = group
-
-    # Build the tensor model-parallel groups.
-    global _TENSOR_MODEL_PARALLEL_GROUP
-    assert (
-        _TENSOR_MODEL_PARALLEL_GROUP is None
-    ), 'tensor model parallel group is already initialized'
-    for i in range(num_tensor_model_parallel_groups):
-        ranks = range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
-        group = torch.distributed.new_group(ranks)
-        if rank in ranks:
-            _TENSOR_MODEL_PARALLEL_GROUP = group
-
-    # Build the pipeline model-parallel groups and embedding groups
-    # (first and last rank in each pipeline model-parallel group).
-    global _PIPELINE_MODEL_PARALLEL_GROUP
-    global _PIPELINE_GLOBAL_RANKS
-    assert (
-        _PIPELINE_MODEL_PARALLEL_GROUP is None
-    ), 'pipeline model parallel group is already initialized'
-    global _EMBEDDING_GROUP
-    global _EMBEDDING_GLOBAL_RANKS
-    assert _EMBEDDING_GROUP is None, 'embedding group is already initialized'
-    global _POSITION_EMBEDDING_GROUP
-    global _POSITION_EMBEDDING_GLOBAL_RANKS
-    assert _POSITION_EMBEDDING_GROUP is None, 'position embedding group is already initialized'
-    # if args.hetero_cluster:
-    #     num_het_pipeline = max(args.stage_dp_size)
-    #     assert num_het_pipeline <= 2, "more dp degree needs complex shuffling.[todo]"
-    #     step_index = [0 for _ in range(len(args.stage_layer_num))]
-    #     base_pipe = [0, 2, 4, 6, 7] # TODO
-    #     for i in range(num_het_pipeline):
-    #         ranks = []
-    #         for j in range(len(step_index)):
-    #             ranks.append(base_pipe[j] + step_index[j])
-    #             if step_index[j] < args.stage_dp_size[j] - 1:
-    #                 step_index[j] += 1
-    #         print(f"pipeline {i}: {ranks}")
-    #         group = torch.distributed.new_group(ranks)
-    #         if rank in ranks:
-    #             _PIPELINE_MODEL_PARALLEL_GROUP = group
-    #             _PIPELINE_GLOBAL_RANKS = ranks
-    #         # Keep below not changed.            
-    #         # Setup embedding group (to exchange gradients between
-    #         # first and last stages).
-    #         if len(ranks) > 1:
-    #             embedding_ranks = [ranks[0], ranks[-1]]
-    #             position_embedding_ranks = [ranks[0]]
-    #             if pipeline_model_parallel_split_rank is not None:
-    #                 if ranks[pipeline_model_parallel_split_rank] not in embedding_ranks:
-    #                     embedding_ranks = [
-    #                         ranks[0],
-    #                         ranks[pipeline_model_parallel_split_rank],
-    #                         ranks[-1],
-    #                     ]
-    #                 if ranks[pipeline_model_parallel_split_rank] not in position_embedding_ranks:
-    #                     position_embedding_ranks = [ranks[0], ranks[pipeline_model_parallel_split_rank]]
-    #         else:
-    #             embedding_ranks = ranks
-    #             position_embedding_ranks = ranks
-
-    #         group = torch.distributed.new_group(embedding_ranks)
-    #         if rank in embedding_ranks:
-    #             _EMBEDDING_GROUP = group
-    #         if rank in ranks:
-    #             _EMBEDDING_GLOBAL_RANKS = embedding_ranks
-
-    #         group = torch.distributed.new_group(position_embedding_ranks)
-    #         if rank in position_embedding_ranks:
-    #             _POSITION_EMBEDDING_GROUP = group
-    #         if rank in ranks:
-    #             _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
-    # else:
-    for i in range(num_pipeline_model_parallel_groups):
-        ranks = range(i, world_size, num_pipeline_model_parallel_groups)
-        group = torch.distributed.new_group(ranks)
-        if rank in ranks:
-            _PIPELINE_MODEL_PARALLEL_GROUP = group
-            _PIPELINE_GLOBAL_RANKS = ranks
-        # Setup embedding group (to exchange gradients between
-        # first and last stages).
-        if len(ranks) > 1:
-            embedding_ranks = [ranks[0], ranks[-1]]
-            position_embedding_ranks = [ranks[0]]
-            if pipeline_model_parallel_split_rank is not None:
-                if ranks[pipeline_model_parallel_split_rank] not in embedding_ranks:
-                    embedding_ranks = [
-                        ranks[0],
-                        ranks[pipeline_model_parallel_split_rank],
-                        ranks[-1],
-                    ]
-                if ranks[pipeline_model_parallel_split_rank] not in position_embedding_ranks:
-                    position_embedding_ranks = [ranks[0], ranks[pipeline_model_parallel_split_rank]]
-        else:
-            embedding_ranks = ranks
-            position_embedding_ranks = ranks
-
-        group = torch.distributed.new_group(embedding_ranks)
-        if rank in embedding_ranks:
-            _EMBEDDING_GROUP = group
-        if rank in ranks:
-            _EMBEDDING_GLOBAL_RANKS = embedding_ranks
-
-        group = torch.distributed.new_group(position_embedding_ranks)
-        if rank in position_embedding_ranks:
-            _POSITION_EMBEDDING_GROUP = group
-        if rank in ranks:
-            _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
-
-    # Build the tensor + data parallel groups.
-    global _TENSOR_AND_DATA_PARALLEL_GROUP
-    global _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
-    assert (
-        _TENSOR_AND_DATA_PARALLEL_GROUP is None
-    ), 'Tensor + data parallel group is already initialized'
-    tensor_and_data_group_size_with_cp: int = tensor_model_parallel_size * data_parallel_size * context_parallel_size
-    num_tensor_and_data_groups_with_cp: int = world_size // tensor_and_data_group_size_with_cp
-    for i in range(num_tensor_and_data_groups_with_cp):
-        start_rank = i * tensor_and_data_group_size_with_cp
-        end_rank = start_rank + tensor_and_data_group_size_with_cp
-        ranks = range(start_rank, end_rank)
-        group = torch.distributed.new_group(ranks)
-        if rank in ranks:
-            _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
-
-        for j in range(context_parallel_size):
-            ranks = []
-            for k in range(data_parallel_size):
-                start_rank = (
-                    i * tensor_and_data_group_size_with_cp
-                    + j * tensor_model_parallel_size
-                    + k * tensor_model_parallel_size * context_parallel_size
-                )
-                end_rank = start_rank + tensor_model_parallel_size
-                ranks = ranks + list(range(start_rank, end_rank))
+                _DATA_PARALLEL_GROUP_WITH_CP = group
+                _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_gloo
+                _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks
+        
+        assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
+        for ranks in parallel_group_config["cp"]:
             group = torch.distributed.new_group(ranks)
             if rank in ranks:
-                _TENSOR_AND_DATA_PARALLEL_GROUP = group
+                _CONTEXT_PARALLEL_GROUP = group
+                _CONTEXT_PARALLEL_GLOBAL_RANKS = ranks
+        
+        # Build the tensor model-parallel groups.
+        assert (
+            _TENSOR_MODEL_PARALLEL_GROUP is None
+        ), 'tensor model parallel group is already initialized'
+        for ranks in parallel_group_config["tp"]:
+            group = torch.distributed.new_group(ranks)
+            if rank in ranks:
+                _TENSOR_MODEL_PARALLEL_GROUP = group
+        
+        # Build the model-parallel groups. TODO: corner case
+        _MODEL_PARALLEL_GROUP = _TENSOR_MODEL_PARALLEL_GROUP
+        
+        # Build the pipeline model-parallel groups and embedding groups
+        # (first and last rank in each pipeline model-parallel group).
+        assert (
+            _PIPELINE_MODEL_PARALLEL_GROUP is None
+        ), 'pipeline model parallel group is already initialized'
+        
+        assert _EMBEDDING_GROUP is None, 'embedding group is already initialized'
+        assert _POSITION_EMBEDDING_GROUP is None, 'position embedding group is already initialized'
+        _PIPELINE_MODEL_PARALLEL_GROUP = []
+        _PIPELINE_GLOBAL_RANKS = []
+        for ranks in parallel_group_config["pp"]:
+            group = torch.distributed.new_group(ranks)
+            if rank in ranks:
+                _PIPELINE_MODEL_PARALLEL_GROUP.append(group)
+                _PIPELINE_GLOBAL_RANKS.append(ranks)
+            # Setup embedding group (to exchange gradients between
+            # first and last stages).
+            if len(ranks) > 1:
+                embedding_ranks = [ranks[0], ranks[-1]]
+                position_embedding_ranks = [ranks[0]]
+                if pipeline_model_parallel_split_rank is not None:
+                    if ranks[pipeline_model_parallel_split_rank] not in embedding_ranks:
+                        embedding_ranks = [
+                            ranks[0],
+                            ranks[pipeline_model_parallel_split_rank],
+                            ranks[-1],
+                        ]
+                    if ranks[pipeline_model_parallel_split_rank] not in position_embedding_ranks:
+                        position_embedding_ranks = [ranks[0], ranks[pipeline_model_parallel_split_rank]]
+            else:
+                embedding_ranks = ranks
+                position_embedding_ranks = ranks
 
-    # Build the tensor + expert parallel groups
-    global _TENSOR_AND_EXPERT_PARALLEL_GROUP
-    assert (
-        _TENSOR_AND_EXPERT_PARALLEL_GROUP is None
-    ), 'Tensor + expert parallel group is already initialized'
-    global _DATA_MODULO_EXPERT_PARALLEL_GROUP
-    assert (
-        _DATA_MODULO_EXPERT_PARALLEL_GROUP is None
-    ), 'Data modulo expert group is already initialized'
-    tensor_and_data_group_size: int = tensor_model_parallel_size * data_parallel_size
-    num_tensor_and_data_groups: int = world_size // tensor_and_data_group_size
-    tensor_and_expert_group_size: int = tensor_model_parallel_size * expert_model_parallel_size
-    num_expert_groups: int = data_parallel_size // expert_model_parallel_size
-    for i in range(num_tensor_and_data_groups):
-        for j in range(num_expert_groups):
-            start_rank = i * tensor_and_data_group_size + j * tensor_and_expert_group_size
-            end_rank = i * tensor_and_data_group_size + (j + 1) * tensor_and_expert_group_size
+            group = torch.distributed.new_group(embedding_ranks)
+            if rank in embedding_ranks:
+                _EMBEDDING_GROUP = group
+            if rank in ranks:
+                _EMBEDDING_GLOBAL_RANKS = embedding_ranks
+
+            group = torch.distributed.new_group(position_embedding_ranks)
+            if rank in position_embedding_ranks:
+                _POSITION_EMBEDDING_GROUP = group
+            if rank in ranks:
+                _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
+        
+        if isinstance(_PIPELINE_MODEL_PARALLEL_GROUP, list) and len(_PIPELINE_MODEL_PARALLEL_GROUP) == 1:
+            _PIPELINE_MODEL_PARALLEL_GROUP = _PIPELINE_MODEL_PARALLEL_GROUP[0]
+            _PIPELINE_GLOBAL_RANKS = _PIPELINE_GLOBAL_RANKS[0]
+        
+        # Build the tensor + data parallel groups. TODO: fix this
+        assert (
+            _TENSOR_AND_DATA_PARALLEL_GROUP is None
+        ), 'Tensor + data parallel group is already initialized'
+        _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = _TENSOR_MODEL_PARALLEL_GROUP
+        _TENSOR_AND_DATA_PARALLEL_GROUP = _TENSOR_MODEL_PARALLEL_GROUP
+
+        # Build the tensor + expert parallel groups, TODO: fix this
+        assert (
+            _TENSOR_AND_EXPERT_PARALLEL_GROUP is None
+        ), 'Tensor + expert parallel group is already initialized'
+        assert (
+            _DATA_MODULO_EXPERT_PARALLEL_GROUP is None
+        ), 'Data modulo expert group is already initialized'
+        # tensor_and_data_group_size: int = tensor_model_parallel_size * data_parallel_size
+        # num_tensor_and_data_groups: int = world_size // tensor_and_data_group_size
+        # tensor_and_expert_group_size: int = tensor_model_parallel_size * expert_model_parallel_size
+        # num_expert_groups: int = data_parallel_size // expert_model_parallel_size
+        # for i in range(num_tensor_and_data_groups):
+        #     for j in range(num_expert_groups):
+        #         start_rank = i * tensor_and_data_group_size + j * tensor_and_expert_group_size
+        #         end_rank = i * tensor_and_data_group_size + (j + 1) * tensor_and_expert_group_size
+        #         ranks = range(start_rank, end_rank)
+        #         group = torch.distributed.new_group(ranks)
+        #         if rank in ranks:
+        #             _TENSOR_AND_EXPERT_PARALLEL_GROUP = group
+
+        # for i in range(num_tensor_and_data_groups):
+        #     start_rank = i * tensor_and_data_group_size
+        #     end_rank = (i + 1) * tensor_and_data_group_size
+        #     for j in range(tensor_and_expert_group_size):
+        #         ranks = range(start_rank + j, end_rank, tensor_and_expert_group_size)
+        #         group = torch.distributed.new_group(ranks)
+        #         if rank in ranks:
+        #             _DATA_MODULO_EXPERT_PARALLEL_GROUP = group
+        _TENSOR_AND_EXPERT_PARALLEL_GROUP = _TENSOR_MODEL_PARALLEL_GROUP
+        _DATA_MODULO_EXPERT_PARALLEL_GROUP = _DATA_PARALLEL_GROUP
+        
+        # Initialize global memory buffer
+        # This isn't really "parallel state" but there isn't another good place to
+        # put this. If we end up with a more generic initialization of megatron-core
+        # we could stick it there
+        _set_global_memory_buffer()
+        
+    else:
+        if (
+            world_size
+            % (tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size)
+            != 0
+        ):
+            raise RuntimeError(
+                f"world_size ({world_size}) is not divisible by tensor_model_parallel_size "
+                f"({tensor_model_parallel_size}) x pipeline_model_parallel_size ({pipeline_model_parallel_size}) "
+                f"x context_parallel_size ({context_parallel_size})"
+            )
+
+        data_parallel_size: int = world_size // (
+            tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size
+        )
+
+        if data_parallel_size % expert_model_parallel_size != 0:
+            raise RuntimeError(
+                f"data_parallel_size ({data_parallel_size}) is not divisible by expert_model_parallel_size "
+            )
+
+        if expert_model_parallel_size > 1 and context_parallel_size > 1:
+            raise RuntimeError(
+                f"combination of expert model prallellism and context parallelism is not supported"
+            )
+
+        num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
+        num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
+
+        if virtual_pipeline_model_parallel_size is not None:
+            if not pipeline_model_parallel_size > 2:
+                raise RuntimeError(
+                    "pipeline-model-parallel size should be greater than 2 with interleaved schedule"
+                )
+            global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
+            global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
+            _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = 0
+            _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = virtual_pipeline_model_parallel_size
+
+        if pipeline_model_parallel_split_rank is not None:
+            # global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
+            _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = pipeline_model_parallel_split_rank
+
+        rank = torch.distributed.get_rank()
+
+        # Build the data-parallel groups.
+        # global _DATA_PARALLEL_GROUP
+        # global _DATA_PARALLEL_GROUP_GLOO
+        # global _DATA_PARALLEL_GLOBAL_RANKS
+        # global _DATA_PARALLEL_GROUP_WITH_CP
+        # global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
+        # global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
+        assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
+        all_data_parallel_group_ranks_with_cp = []
+        
+        for i in range(pipeline_model_parallel_size):
+            start_rank = i * num_pipeline_model_parallel_groups
+            end_rank = (i + 1) * num_pipeline_model_parallel_groups
+            for j in range(context_parallel_size * tensor_model_parallel_size):
+                ranks = range(
+                    start_rank + j, end_rank, context_parallel_size * tensor_model_parallel_size
+                )
+                group = torch.distributed.new_group(ranks)
+                group_gloo = torch.distributed.new_group(ranks, backend="gloo")
+                if rank in ranks:
+                    _DATA_PARALLEL_GROUP = group
+                    _DATA_PARALLEL_GROUP_GLOO = group_gloo
+                    _DATA_PARALLEL_GLOBAL_RANKS = ranks
+            for j in range(tensor_model_parallel_size):
+                ranks_with_cp = range(start_rank + j, end_rank, tensor_model_parallel_size)
+                all_data_parallel_group_ranks_with_cp.append(list(ranks_with_cp))
+                group_with_cp = torch.distributed.new_group(ranks_with_cp)
+                group_with_cp_gloo = torch.distributed.new_group(ranks_with_cp, backend="gloo")
+                if rank in ranks_with_cp:
+                    _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
+                    _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
+                    _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
+
+        # Apply SHARP to DP process groups
+        if use_sharp:
+            if rank == 0:
+                print(
+                    "The number of process groups to use SHARP with depends on the type "
+                    "of the network switch. Nvidia QM1 switch supports SAHRP up to 8 "
+                    "process groups and QM2 supports up to 256 process groups. We apply "
+                    "SHARP to the communications of the data-parallel domain. If the "
+                    "number of data-parallel process groups is larger than the max "
+                    "process groups that the network switch supports, the communication "
+                    "will fall back to non-SHARP operators. To enable SHARP, "
+                    "`#SBATCH_NETWORK=sharp` should be set in the sbatch script."
+                )
+            torch.distributed.barrier(
+                group=get_data_parallel_group(with_context_parallel=context_parallel_size > 1),
+                device_ids=[torch.cuda.current_device()],
+            )
+            # Set `NCCL_SHARP_DISABLE=1` to restrict SHARP application to DP process groups
+            os.environ["NCCL_SHARP_DISABLE"] = "1"
+
+        # Build the context-parallel groups.
+        # global _CONTEXT_PARALLEL_GROUP
+        # global _CONTEXT_PARALLEL_GLOBAL_RANKS
+        assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
+        for i in range(pipeline_model_parallel_size):
+            for j in range(data_parallel_size):
+                start_rank = (
+                    i * num_pipeline_model_parallel_groups
+                    + j * tensor_model_parallel_size * context_parallel_size
+                )
+                end_rank = (
+                    i * num_pipeline_model_parallel_groups
+                    + (j + 1) * tensor_model_parallel_size * context_parallel_size
+                )
+                for k in range(tensor_model_parallel_size):
+                    ranks = range(start_rank + k, end_rank, tensor_model_parallel_size)
+                    group = torch.distributed.new_group(ranks)
+                    if rank in ranks:
+                        _CONTEXT_PARALLEL_GROUP = group
+                        _CONTEXT_PARALLEL_GLOBAL_RANKS = ranks
+
+        # Build the model-parallel groups.
+        # global _MODEL_PARALLEL_GROUP
+        assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
+        # if args.hetero_cluster:
+        #     pass
+        # else:
+        for i in range(data_parallel_size * context_parallel_size):
+            ranks = [
+                data_parallel_group_ranks_with_cp[i]
+                for data_parallel_group_ranks_with_cp in all_data_parallel_group_ranks_with_cp
+            ]
+            group = torch.distributed.new_group(ranks)
+            if rank in ranks:
+                _MODEL_PARALLEL_GROUP = group
+
+        # Build the tensor model-parallel groups.
+        # global _TENSOR_MODEL_PARALLEL_GROUP
+        assert (
+            _TENSOR_MODEL_PARALLEL_GROUP is None
+        ), 'tensor model parallel group is already initialized'
+        for i in range(num_tensor_model_parallel_groups):
+            ranks = range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
+            group = torch.distributed.new_group(ranks)
+            if rank in ranks:
+                _TENSOR_MODEL_PARALLEL_GROUP = group
+
+        # Build the pipeline model-parallel groups and embedding groups
+        # (first and last rank in each pipeline model-parallel group).
+        # global _PIPELINE_MODEL_PARALLEL_GROUP
+        # global _PIPELINE_GLOBAL_RANKS
+        assert (
+            _PIPELINE_MODEL_PARALLEL_GROUP is None
+        ), 'pipeline model parallel group is already initialized'
+        # global _EMBEDDING_GROUP
+        # global _EMBEDDING_GLOBAL_RANKS
+        assert _EMBEDDING_GROUP is None, 'embedding group is already initialized'
+        # global _POSITION_EMBEDDING_GROUP
+        # global _POSITION_EMBEDDING_GLOBAL_RANKS
+        assert _POSITION_EMBEDDING_GROUP is None, 'position embedding group is already initialized'
+       
+        for i in range(num_pipeline_model_parallel_groups):
+            ranks = range(i, world_size, num_pipeline_model_parallel_groups)
+            group = torch.distributed.new_group(ranks)
+            if rank in ranks:
+                _PIPELINE_MODEL_PARALLEL_GROUP = group
+                _PIPELINE_GLOBAL_RANKS = ranks
+            # Setup embedding group (to exchange gradients between
+            # first and last stages).
+            if len(ranks) > 1:
+                embedding_ranks = [ranks[0], ranks[-1]]
+                position_embedding_ranks = [ranks[0]]
+                if pipeline_model_parallel_split_rank is not None:
+                    if ranks[pipeline_model_parallel_split_rank] not in embedding_ranks:
+                        embedding_ranks = [
+                            ranks[0],
+                            ranks[pipeline_model_parallel_split_rank],
+                            ranks[-1],
+                        ]
+                    if ranks[pipeline_model_parallel_split_rank] not in position_embedding_ranks:
+                        position_embedding_ranks = [ranks[0], ranks[pipeline_model_parallel_split_rank]]
+            else:
+                embedding_ranks = ranks
+                position_embedding_ranks = ranks
+
+            group = torch.distributed.new_group(embedding_ranks)
+            if rank in embedding_ranks:
+                _EMBEDDING_GROUP = group
+            if rank in ranks:
+                _EMBEDDING_GLOBAL_RANKS = embedding_ranks
+
+            group = torch.distributed.new_group(position_embedding_ranks)
+            if rank in position_embedding_ranks:
+                _POSITION_EMBEDDING_GROUP = group
+            if rank in ranks:
+                _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
+
+        # Build the tensor + data parallel groups.
+        # global _TENSOR_AND_DATA_PARALLEL_GROUP
+        # global _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
+        assert (
+            _TENSOR_AND_DATA_PARALLEL_GROUP is None
+        ), 'Tensor + data parallel group is already initialized'
+        tensor_and_data_group_size_with_cp: int = tensor_model_parallel_size * data_parallel_size * context_parallel_size
+        num_tensor_and_data_groups_with_cp: int = world_size // tensor_and_data_group_size_with_cp
+        for i in range(num_tensor_and_data_groups_with_cp):
+            start_rank = i * tensor_and_data_group_size_with_cp
+            end_rank = start_rank + tensor_and_data_group_size_with_cp
             ranks = range(start_rank, end_rank)
             group = torch.distributed.new_group(ranks)
             if rank in ranks:
-                _TENSOR_AND_EXPERT_PARALLEL_GROUP = group
+                _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
 
-    for i in range(num_tensor_and_data_groups):
-        start_rank = i * tensor_and_data_group_size
-        end_rank = (i + 1) * tensor_and_data_group_size
-        for j in range(tensor_and_expert_group_size):
-            ranks = range(start_rank + j, end_rank, tensor_and_expert_group_size)
-            group = torch.distributed.new_group(ranks)
-            if rank in ranks:
-                _DATA_MODULO_EXPERT_PARALLEL_GROUP = group
+            for j in range(context_parallel_size):
+                ranks = []
+                for k in range(data_parallel_size):
+                    start_rank = (
+                        i * tensor_and_data_group_size_with_cp
+                        + j * tensor_model_parallel_size
+                        + k * tensor_model_parallel_size * context_parallel_size
+                    )
+                    end_rank = start_rank + tensor_model_parallel_size
+                    ranks = ranks + list(range(start_rank, end_rank))
+                group = torch.distributed.new_group(ranks)
+                if rank in ranks:
+                    _TENSOR_AND_DATA_PARALLEL_GROUP = group
 
-    # Initialize global memory buffer
-    # This isn't really "parallel state" but there isn't another good place to
-    # put this. If we end up with a more generic initialization of megatron-core
-    # we could stick it there
-    _set_global_memory_buffer()
+        # Build the tensor + expert parallel groups
+        # global _TENSOR_AND_EXPERT_PARALLEL_GROUP
+        assert (
+            _TENSOR_AND_EXPERT_PARALLEL_GROUP is None
+        ), 'Tensor + expert parallel group is already initialized'
+        # global _DATA_MODULO_EXPERT_PARALLEL_GROUP
+        assert (
+            _DATA_MODULO_EXPERT_PARALLEL_GROUP is None
+        ), 'Data modulo expert group is already initialized'
+        tensor_and_data_group_size: int = tensor_model_parallel_size * data_parallel_size
+        num_tensor_and_data_groups: int = world_size // tensor_and_data_group_size
+        tensor_and_expert_group_size: int = tensor_model_parallel_size * expert_model_parallel_size
+        num_expert_groups: int = data_parallel_size // expert_model_parallel_size
+        for i in range(num_tensor_and_data_groups):
+            for j in range(num_expert_groups):
+                start_rank = i * tensor_and_data_group_size + j * tensor_and_expert_group_size
+                end_rank = i * tensor_and_data_group_size + (j + 1) * tensor_and_expert_group_size
+                ranks = range(start_rank, end_rank)
+                group = torch.distributed.new_group(ranks)
+                if rank in ranks:
+                    _TENSOR_AND_EXPERT_PARALLEL_GROUP = group
+
+        for i in range(num_tensor_and_data_groups):
+            start_rank = i * tensor_and_data_group_size
+            end_rank = (i + 1) * tensor_and_data_group_size
+            for j in range(tensor_and_expert_group_size):
+                ranks = range(start_rank + j, end_rank, tensor_and_expert_group_size)
+                group = torch.distributed.new_group(ranks)
+                if rank in ranks:
+                    _DATA_MODULO_EXPERT_PARALLEL_GROUP = group
+
+        # Initialize global memory buffer
+        # This isn't really "parallel state" but there isn't another good place to
+        # put this. If we end up with a more generic initialization of megatron-core
+        # we could stick it there
+        _set_global_memory_buffer()
+        
+        # Get heterogeneous cluster info
+        self_device_type = os.environ.get('DEVICE_TYPE', None)
+        global _HETERO_DEVICE_TYPES
+        if args.hetero_cluster and args.stage_recompute_num_layers is not None:
+            print(f'_HETERO_DEVICE_TYPES={_HETERO_DEVICE_TYPES}', flush=True)
+            args.recompute_num_layers = args.stage_recompute_num_layers[get_pipeline_model_parallel_rank()]
+            print(f"Recompute {args.recompute_num_layers} for stage {get_pipeline_model_parallel_rank()}")
+        if self_device_type is not None:
+            self_device_type = int(self_device_type)
+            self_device_type = torch.tensor([self_device_type], device=torch.cuda.current_device(), dtype=torch.int32)
+            all_device_types = [torch.zeros([1], device=torch.cuda.current_device(), dtype=torch.int32) for _ in range(world_size)]
+            torch.distributed.all_gather(all_device_types, self_device_type)
+            _HETERO_DEVICE_TYPES = list(t.tolist()[0] for t in all_device_types)
+            print(f"device memory={torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory/1024/1024/1024}GB", flush=True)
+        
+    # print(f"localrank={rank}, pipeline global ranks={get_pipeline_model_parallel_rank()}, prev rank={get_pipeline_model_parallel_prev_rank()}, next rank={get_pipeline_model_parallel_next_rank()}, first rank={get_pipeline_model_parallel_first_rank()}, last rank={get_pipeline_model_parallel_last_rank()}, is first stage={is_pipeline_first_stage()}, is last stage={is_pipeline_last_stage()}", flush=True)
+
+
+def set_micro_batch_dp_dispatcher(graph: nx.DiGraph, graph_depth: dict, micro_batch_size: int):
+    """For the given graph and the number of micro-batches, determine the flow of micro-batch data for stages."""
+    # Currently for pipeline + data parallel. TODO tensor parallel.
+    stages = sorted(list(set(graph_depth.values())))
+    stage_device_list = []
+    for stage in stages:
+        ranks = []
+        for node in sorted(graph_depth.keys()):
+            if graph_depth[node] == stage:
+                ranks.append(node)
+        stage_device_list.append(ranks)
+    print(f'stage_device_list={stage_device_list}', flush=True)
+    # Mode 1: uniform sharding
+    per_device_micro_batch_sizes = {}
+    for stage, ranks in enumerate(stage_device_list):
+        if micro_batch_size % len(ranks) == 0:
+            per_device_micro_batch_sizes[stage] = {d: micro_batch_size // len(ranks) for d in ranks}
+        else:            
+            rounded_bs = int(micro_batch_size // len(ranks))
+            per_device_micro_batch_sizes[stage] = {d: rounded_bs for d in ranks[:-1]}
+            per_device_micro_batch_sizes[stage][ranks[-1]] = micro_batch_size - (len(ranks) - 1) * rounded_bs
     
-    # Get heterogeneous cluster info
-    self_device_type = os.environ.get('DEVICE_TYPE', None)
-    global _HETERO_DEVICE_TYPES
-    if args.hetero_cluster and args.stage_recompute_num_layers is not None:
-        args.recompute_num_layers = args.stage_recompute_num_layers[get_pipeline_model_parallel_rank()]
-        print(f"Recompute {args.recompute_num_layers} for stage {get_pipeline_model_parallel_rank()}")
-    if self_device_type is not None:
-        self_device_type = int(self_device_type)
-        self_device_type = torch.tensor([self_device_type], device=torch.cuda.current_device(), dtype=torch.int32)
-        all_device_types = [torch.zeros([1], device=torch.cuda.current_device(), dtype=torch.int32) for _ in range(world_size)]
-        torch.distributed.all_gather(all_device_types, self_device_type)
-        _HETERO_DEVICE_TYPES = list(t.tolist()[0] for t in all_device_types)
-        print(f"device memory={torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory/1024/1024/1024}GB", flush=True)
-    print(f'_HETERO_DEVICE_TYPES={_HETERO_DEVICE_TYPES}', flush=True)
+    # TODO Mode 2: manual sharding
+    
+    # Set micro-batch numbers to edge weights
+    for stage in per_device_micro_batch_sizes.keys():
+        for rank, input_bs in per_device_micro_batch_sizes[stage].items():
+            predes = [pred for pred in graph.predecessors(rank)]
+            for i, pred in enumerate(predes):
+                if input_bs % len(predes) == 0:
+                    print(f"update rank={rank}, pred={pred}, weight = {input_bs // len(predes)}", flush=True)
+                    graph[pred][rank]['weight'] = input_bs // len(predes)
+                else:
+                    rounded_bs = int(input_bs // len(predes))
+                    if i != len(predes) - 1:
+                        graph[pred][rank]['weight'] = rounded_bs
+                    else:
+                        graph[pred][rank]['weight'] = input_bs - (len(predes) - 1) * rounded_bs
+
 
 def is_unitialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
@@ -550,12 +726,28 @@ def get_tensor_model_parallel_group(check_initialized=True):
     return _TENSOR_MODEL_PARALLEL_GROUP
 
 
-def get_pipeline_model_parallel_group():
+def get_pipeline_model_parallel_group(group_id=None):
     """Get the pipeline model parallel group the caller rank belongs to."""
     assert (
         _PIPELINE_MODEL_PARALLEL_GROUP is not None
     ), 'pipeline_model parallel group is not initialized'
-    return _PIPELINE_MODEL_PARALLEL_GROUP
+    if group_id is None:
+        return _PIPELINE_MODEL_PARALLEL_GROUP
+    else:
+        assert len(group_id) >= len(_PIPELINE_MODEL_PARALLEL_GROUP)
+        return _PIPELINE_MODEL_PARALLEL_GROUP[group_id]
+
+    
+def get_pipeline_model_parallel_group_id():
+    """Get the pipeline model parallel group the caller rank belongs to."""
+    assert (
+        _PIPELINE_MODEL_PARALLEL_GROUP is not None
+    ), 'pipeline_model parallel group is not initialized'
+    args = get_args()
+    for index, pipe in enumerate(args.pipe_depth):
+        if torch.distributed.get_rank() in pipe.keys():
+            return index
+    raise RuntimeError("Get pipeline parallel group id error!")
 
 
 def get_data_parallel_group(with_context_parallel=False):
@@ -683,7 +875,10 @@ def get_pipeline_model_parallel_world_size():
     global _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     if _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE is not None:
         return _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
-    return torch.distributed.get_world_size(group=get_pipeline_model_parallel_group())
+    args = get_args()
+    # assert all pipelines have the same length.
+    return max(args.pipe_depth[0].values()) + 1
+    # return torch.distributed.get_world_size(group=group)
 
 
 def set_tensor_model_parallel_rank(rank):
@@ -712,12 +907,21 @@ def get_tensor_model_parallel_rank():
     return torch.distributed.get_rank(group=get_tensor_model_parallel_group())
 
 
-def get_pipeline_model_parallel_rank():
+def get_pipeline_model_parallel_rank(group_id=None):
     """Return my rank for the pipeline model parallel group."""
     global _MPU_PIPELINE_MODEL_PARALLEL_RANK
-    if _MPU_PIPELINE_MODEL_PARALLEL_RANK is not None:
-        return _MPU_PIPELINE_MODEL_PARALLEL_RANK
-    return torch.distributed.get_rank(group=get_pipeline_model_parallel_group())
+    # if _MPU_PIPELINE_MODEL_PARALLEL_RANK is not None:
+    #     return _MPU_PIPELINE_MODEL_PARALLEL_RANK
+    ###############
+    args = get_args()
+    if group_id is not None:
+        assert len(args.pipe_depth) >= group_id, \
+            f"Cannot find pipe for group {group_id}, pipe depth len={len(args.pipe_depth)}"
+        return args.pipe_depth[group_id][torch.distributed.get_rank()]
+    for pipe in args.pipe_depth:
+        if torch.distributed.get_rank() in pipe.keys():
+            return pipe[torch.distributed.get_rank()]
+    raise RuntimeError("Get pipeline parallel rank error!")
 
 
 def get_pipeline_model_parallel_split_rank():
@@ -726,7 +930,7 @@ def get_pipeline_model_parallel_split_rank():
     return _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
 
 
-def is_pipeline_first_stage(ignore_virtual=False):
+def is_pipeline_first_stage(ignore_virtual=False, group_id=None):
     """Return True if in the first pipeline model-parallel stage, False otherwise."""
     if not ignore_virtual:
         if (
@@ -734,10 +938,12 @@ def is_pipeline_first_stage(ignore_virtual=False):
             and get_virtual_pipeline_model_parallel_rank() != 0
         ):
             return False
-    return get_pipeline_model_parallel_rank() == 0
+    
+    rank = get_pipeline_model_parallel_rank(group_id)
+    return rank == 0
 
 
-def is_pipeline_last_stage(ignore_virtual=False):
+def is_pipeline_last_stage(ignore_virtual=False, group_id=None):
     """Return True if in the last pipeline model-parallel stage, False otherwise."""
     if not ignore_virtual:
         virtual_pipeline_model_parallel_world_size = (
@@ -747,7 +953,8 @@ def is_pipeline_last_stage(ignore_virtual=False):
             virtual_pipeline_model_parallel_world_size - 1
         ):
             return False
-    return get_pipeline_model_parallel_rank() == (get_pipeline_model_parallel_world_size() - 1)
+    rank = get_pipeline_model_parallel_rank(group_id)
+    return rank == (get_pipeline_model_parallel_world_size() - 1)
 
 
 def is_rank_in_embedding_group(ignore_virtual=False):
@@ -850,35 +1057,54 @@ def get_data_parallel_src_rank(with_context_parallel=False):
         return _DATA_PARALLEL_GLOBAL_RANKS[0]
 
 
-def get_pipeline_model_parallel_first_rank():
+def get_pipeline_model_parallel_first_rank(group_id=None):
     """Return the global rank of the first process in the pipeline for the
-    current tensor parallel group"""
-    assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel group is not initialized"
-    return _PIPELINE_GLOBAL_RANKS[0]
+    current tensor parallel group"""    
+    # For all devices in the given group, they have the same first or last rank(s).
+    args = get_args()
+    if group_id is not None:
+        ranks = [k for k, v in args.pipe_depth[group_id] if v == 0]
+    else:
+        for pipe in args.pipe_depth:
+            if torch.distributed.get_rank() in pipe:
+                ranks = [k for k, v in pipe.items() if v == 0]
+    return ranks[0] if len(ranks) == 1 else ranks
 
 
-def get_pipeline_model_parallel_last_rank():
+def get_pipeline_model_parallel_last_rank(group_id=None):
     """Return the global rank of the last process in the pipeline for the
     current tensor parallel group"""
-    assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel group is not initialized"
     last_rank_local = get_pipeline_model_parallel_world_size() - 1
-    return _PIPELINE_GLOBAL_RANKS[last_rank_local]
+    args = get_args()
+    if group_id is not None:
+        ranks = [k for k, v in args.pipe_depth[group_id] if v == last_rank_local]
+    else:
+        for pipe in args.pipe_depth:
+            if torch.distributed.get_rank() in pipe:
+                ranks = [k for k, v in pipe.items() if v == last_rank_local]
+    return ranks[0] if len(ranks) == 1 else ranks
 
 
-def get_pipeline_model_parallel_next_rank():
+def get_pipeline_model_parallel_next_rank(group_id=None):
     """Return the global rank that follows the caller in the pipeline"""
     assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel group is not initialized"
-    rank_in_pipeline = get_pipeline_model_parallel_rank()
+    rank_in_pipeline = get_pipeline_model_parallel_rank(group_id)
     world_size = get_pipeline_model_parallel_world_size()
-    return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline + 1) % world_size]
+    if group_id is not None:
+        return _PIPELINE_GLOBAL_RANKS[group_id][(rank_in_pipeline + 1) % world_size]
+    else:
+        return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline + 1) % world_size]
 
 
-def get_pipeline_model_parallel_prev_rank():
+def get_pipeline_model_parallel_prev_rank(group_id=None):
     """Return the global rank that preceeds the caller in the pipeline"""
     assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel group is not initialized"
-    rank_in_pipeline = get_pipeline_model_parallel_rank()
+    rank_in_pipeline = get_pipeline_model_parallel_rank(group_id)
     world_size = get_pipeline_model_parallel_world_size()
-    return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline - 1) % world_size]
+    if group_id is not None:
+        _PIPELINE_GLOBAL_RANKS[group_id][(rank_in_pipeline - 1) % world_size]
+    else:
+        return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline - 1) % world_size]
 
 
 def get_data_parallel_world_size(with_context_parallel=False):
