@@ -178,7 +178,7 @@ def _batched_p2p_ops(
             )
             # print(f"local rank={torch.distributed.get_rank()}, recv next={succ}", flush=True)
             ops.append(recv_next_op)
-        print(f"recvd tensor={tensor_recv_next}")
+        # print(f"recvd tensor={tensor_recv_next}")
     if len(ops) > 0:
         reqs = torch.distributed.batch_isend_irecv(ops)
     else:

@@ -1,29 +1,21 @@
 #! /bin/bash
 set -x
 
-
-
-export NNODES=$(( $DATA_PARALLEL_SIZE * $TENSOR_PARALLEL_SIZE * $PIPELINE_PARALLEL_SIZE / $GPUS_PER_NODE))
+# export NNODES=$(( $DATA_PARALLEL_SIZE * $TENSOR_PARALLEL_SIZE * $PIPELINE_PARALLEL_SIZE / $GPUS_PER_NODE))
 export MASTER_ADDR="octave"
-export NODE_RANK=$(expr $SLURM_PROCID / $NNODES)
-export WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
+# export NODE_RANK=$(expr $SLURM_PROCID / $NNODES)
+# export WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 export RANK=$SLURM_PROCID
 export CUDA_DEVICE_MAX_CONNECTIONS=1 # for async gradient all reduce
 
-# export CUDA_VISIBLE_DEVICES=0,1,2,3,4
-# if [ "$RANK" == "4" ] || [ "$RANK" == "5" ]; then
-#    echo $RANK existaaaaaa!
-#    exit 0 # hard coding for gpu index issue
-# fi
-
-# if [ `hostname` == "twills" ]; then
-#    echo twills change index, $RANK
-#    export RANK=$(( $RANK-2 )) # hard coding for gpu index issue
-#    echo twills change index, $RANK
-# fi
-
-export GLOO_SOCKET_IFNAME=eno1
-export NCCL_SOCKET_IFNAME=eno1
+current_hostname=$(hostname)
+if [ "$current_hostname" == "octave" ]; then
+    export GLOO_SOCKET_IFNAME=eno1
+    export NCCL_SOCKET_IFNAME=eno1
+else
+    export GLOO_SOCKET_IFNAME=enp68s0f0
+    export NCCL_SOCKET_IFNAME=enp68s0f0
+fi
 export NCCL_IB_DISABLE=1
 
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
@@ -44,8 +36,6 @@ exec python \
         --vocab-file $VOCAB_FILE \
 	--merge-file $MERGE_FILE \
         --transformer-impl local \
-	--tensor-model-parallel-size $TENSOR_PARALLEL_SIZE \
-	--pipeline-model-parallel-size $PIPELINE_PARALLEL_SIZE \
 	--num-layers $NUM_LAYERS \
 	--hidden-size $HIDDEN_SIZE \
         --num-attention-heads $NUM_ATTN_HEADS \
@@ -70,9 +60,10 @@ exec python \
         --init-method-std 0.002 \
         --fp16 \
         --recompute-granularity selective \
-        --hetero-cluster True \
-        --enable-hetero-compression $COMPRESS \
-        --stage-layer-num $LL
+        --hetero-cluster False \
+        --parallel-config /home/zanzong/workspace/Megatron-LM/tangram_config_twi_oct.json
+        # --enable-hetero-compression $COMPRESS \
+        # --stage-layer-num $LL
         # --recompute-granularity full \
         # --recompute-method block \
         # --stage-recompute-num-layers 1 1 2 2

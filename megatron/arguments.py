@@ -98,12 +98,32 @@ def validate_args(args, defaults={}):
                     ' to be less than pipeline model parallel size ({})'.format(
                             args.pipeline_model_parallel_size)
     """
+
+    if args.hetero_cluster:
+        if not hasattr(args, "stage_recompute_num_layers"):
+            args.stage_recompute_num_layers = None
+        
+        if args.parallel_config != "":
+            try:
+                with open(args.parallel_config, "r", encoding="utf-8") as file:
+                    args.parallel_config = json.load(file)
+                deps_builder = {}
+                for key, val in args.parallel_config["pipe_deps"].items():
+                    deps_builder[int(key)] = val
+                del args.parallel_config["pipe_deps"]
+                args.parallel_config["pipe_deps"] = deps_builder
+            except FileNotFoundError:
+                print(f"Config file {args.parallel_config} not found.")
+            except json.JSONDecodeError:
+                print(f"Config file {args.parallel_config} format error.")
+        print(f"parse parallel config: {args.parallel_config}", flush=True)
+
     # TODO auto configure this through config file.
-    args.tensor_model_parallel_size = 1
-    args.data_parallel_size = 2 # with partial inner data parallel
-    args.pipeline_model_parallel_size = 2
+    args.tensor_model_parallel_size = args.parallel_config["tensor_parallel_size"]
+    args.data_parallel_size = args.parallel_config["data_parallel_size"]
+    args.pipeline_model_parallel_size = args.parallel_config["pipeline_parallel_size"]
     args.transformer_pipeline_model_parallel_size = args.pipeline_model_parallel_size
-    args.world_size = 8
+    args.world_size = int(os.getenv("WORLD_SIZE", 1))
     
     # Deprecated arguments
     assert args.batch_size is None, '--batch-size argument is no longer ' \
@@ -394,17 +414,7 @@ def validate_args(args, defaults={}):
         if args.tensor_model_parallel_size > 1:
             assert args.sequence_parallel, \
                 "When using expert parallelism and tensor parallelism, sequence parallelism must be used."
-                
-    if args.hetero_cluster:
-        assert args.stage_layer_num is not None, "If training on heterogeneous cluster, manually specify the layer number of each stage."
-        print(f"get param. args.stage_layer_num={args.stage_layer_num}", flush=True)
-        # assert len(args.stage_layer_num) == args.pipeline_model_parallel_size, "len of stage-layer-num must equal to pipeline-model-parallel-size"
-        if not hasattr(args, "stage_recompute_num_layers"):
-            args.stage_recompute_num_layers = None
-        # if args.stage_dp_size is None:
-        #     args.stage_dp_size = [args.data_parallel_size for _ in range(args.pipeline_model_parallel_size)]
-        # assert len(args.stage_dp_size) == len(args.stage_layer_num)
-        
+
     # Print arguments.
     _print_args("arguments", args)
     retro_args = get_retro_args()
@@ -1095,13 +1105,13 @@ def _add_distributed_args(parser):
                        help='If set to True, the uneven pipeline division will be used.')
     group.add_argument('--stage-layer-num', nargs='+', type=int, required=False,
                        help='If hetero-cluster is set to True, the number of layers need to be specified.')
-    group.add_argument('--stage-dp-size', nargs='+', type=int, required=False,
-                       help='If hetero-cluster is set to True, the data parallel size of each stage. use data parallel size if not specified.')
     group.add_argument('--stage-recompute-num-layers', nargs='+', type=int, required=False,
                        help='If using recompute and hetero-cluster is set to True, '
                        'the number of recomputed layers is required.')
     group.add_argument('--enable-hetero-compression', type=int, default=0, required=False,
                        help='If set to 1, inter-cluster grad will be compressed.')
+    group.add_argument('--parallel-config', type=str, default="", required=False,
+                       help='Json configuration file for Tangram.')
     return parser
 
 

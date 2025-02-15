@@ -1433,7 +1433,7 @@ class ParallelTransformer(MegatronModule):
         # If using hetero devices, the layer division should be imbalance.
         imbalance_offset = None
         if args.hetero_cluster:
-            self.num_layers = args.stage_layer_num[mpu.get_pipeline_model_parallel_rank()]
+            self.num_layers = args.parallel_config["stage_layer_num"][mpu.get_pipeline_model_parallel_rank()]
             print(f"\nRank={torch.distributed.get_rank()}: get {self.num_layers} layers for stage {mpu.get_pipeline_model_parallel_rank()}", flush=True)
         else:
             self.num_layers = _get_num_layers(args, model_type,
@@ -1530,7 +1530,7 @@ class ParallelTransformer(MegatronModule):
         else:
             # Each stage gets a contiguous set of layers.
             if args.hetero_cluster:
-                offset = sum(args.stage_layer_num[:mpu.get_pipeline_model_parallel_rank()])
+                offset = sum(args.parallel_config["stage_layer_num"][:mpu.get_pipeline_model_parallel_rank()])
             else:
                 if args.model_type == ModelType.encoder_and_decoder and \
                         mpu.get_pipeline_model_parallel_world_size() > 1:

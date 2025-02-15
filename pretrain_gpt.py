@@ -101,12 +101,13 @@ def get_batch(data_iterator):
 
     if parallel_state.is_pipeline_last_stage():
         # shard data according to dependency
-        g = args.pipe_graph[parallel_state.get_pipeline_model_parallel_group_id()]
-        pred = [pred for pred in g.predecessors(torch.distributed.get_rank())][0]
-        shard_ranks = [_ for _ in g.successors(pred)]
-        shard_index = shard_ranks.index(torch.distributed.get_rank())
+        last_stage_devices = args.pipe_stage_device[parallel_state.get_pipeline_model_parallel_group_id()][-1]
+        # g = args.pipe_graph[parallel_state.get_pipeline_model_parallel_group_id()]
+        # pred = [pred for pred in g.predecessors(torch.distributed.get_rank())][0]
+        # shard_ranks = [_ for _ in g.successors(pred)]
+        shard_index = last_stage_devices.index(torch.distributed.get_rank())
         # sharded_batch_size = g[pred][torch.distributed.get_rank()]["weight"]
-        shard_num = len(shard_ranks)
+        shard_num = len(last_stage_devices)
         shard_index = shard_index
         print(f"get_batch tokens shape={tokens.shape}, labels shape={labels.shape}", flush=True)
         if shard_num > 1:

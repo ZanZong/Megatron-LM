@@ -176,18 +176,13 @@ def initialize_model_parallel(
     world_size: int = torch.distributed.get_world_size()
     args = get_args()
     # generate this config through parallelism degree?
-    parallel_group_config = {
-        "tp": [[0], [1], [2], [3], [4], [5], [6], [7]],
-        "cp": [[0], [1], [2], [3], [4], [5], [6], [7]],
-        "dp": [[0, 1], [2, 3, 4, 5, 6, 7]],
-        "pp": [[0, 2, 3, 4], [1, 5, 6, 7]],
-    }
-    pipe_deps = [[(0, 2), (0, 3), (0, 4)], [(1, 5), (1, 6), (1, 7)]]
-    args.parallel_group_config = parallel_group_config
+    parallel_groups = args.parallel_config["parallel_groups"]
+    pipe_deps = [args.parallel_config["pipe_deps"][pipe_id] for pipe_id in sorted(args.parallel_config["pipe_deps"].keys())]
     print("call parallel state init", flush=True)
     # graph analyze
     pipe_graph = []
     pipe_depth = []
+    pipe_stage_device = []
     for deps in pipe_deps:
         devices = sorted(list({device for tup in deps for device in tup}))
         device_list = sorted(list(devices))
@@ -207,12 +202,26 @@ def initialize_model_parallel(
                 g.add_edge(-1, node)
         pipe_graph.append(g)
         pipe_depth.append(depth)
+        
+        # Currently for pipeline + data parallel. TODO tensor parallel.
+        stages = sorted(list(set(depth.values())))
+        stage_device_list = []
+        for stage in stages:
+            ranks = []
+            for node in sorted(depth.keys()):
+                if depth[node] == stage:
+                    ranks.append(node)
+            stage_device_list.append(ranks)
+        print(f'stage_device_list={stage_device_list}', flush=True)
+        pipe_stage_device.append(stage_device_list)
     args.pipe_depth = pipe_depth
+    args.pipe_stage_device = pipe_stage_device
     print(f"args.pipe_depth={args.pipe_depth}\n\n", flush=True)
     args.pipe_graph = pipe_graph
     init_group_from_config = True
-    set_micro_batch_dp_dispatcher(args.pipe_graph[0], args.pipe_depth[0], 9)    
-    set_micro_batch_dp_dispatcher(args.pipe_graph[1], args.pipe_depth[1], 9)
+    for graph, depth in zip(args.pipe_graph, args.pipe_depth):
+        set_micro_batch_dp_dispatcher(graph, depth, args.parallel_config["micro_batch_size"])
+        set_micro_batch_dp_dispatcher(graph, depth, args.parallel_config["micro_batch_size"])
     
     global _DATA_PARALLEL_GROUP
     global _DATA_PARALLEL_GROUP_GLOO
@@ -240,8 +249,8 @@ def initialize_model_parallel(
 
         if virtual_pipeline_model_parallel_size is not None:
             raise RuntimeError("virtual pipeline model paralllel is to be supported.")
-        num_tensor_model_parallel_groups = len(parallel_group_config["tp"])
-        num_pipeline_model_parallel_groups = len(parallel_group_config["pp"])
+        num_tensor_model_parallel_groups = len(parallel_groups["tp"])
+        num_pipeline_model_parallel_groups = len(parallel_groups["pp"])
         
         if pipeline_model_parallel_split_rank is not None:
             _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = pipeline_model_parallel_split_rank
@@ -252,7 +261,7 @@ def initialize_model_parallel(
         assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
         all_data_parallel_group_ranks_with_cp = []
         
-        for ranks in parallel_group_config["dp"]:
+        for ranks in parallel_groups["dp"]:
             group = torch.distributed.new_group(ranks)
             group_gloo = torch.distributed.new_group(ranks, backend="gloo")
             if rank in ranks:
@@ -264,7 +273,7 @@ def initialize_model_parallel(
                 _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks
         
         assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
-        for ranks in parallel_group_config["cp"]:
+        for ranks in parallel_groups["cp"]:
             group = torch.distributed.new_group(ranks)
             if rank in ranks:
                 _CONTEXT_PARALLEL_GROUP = group
@@ -274,7 +283,7 @@ def initialize_model_parallel(
         assert (
             _TENSOR_MODEL_PARALLEL_GROUP is None
         ), 'tensor model parallel group is already initialized'
-        for ranks in parallel_group_config["tp"]:
+        for ranks in parallel_groups["tp"]:
             group = torch.distributed.new_group(ranks)
             if rank in ranks:
                 _TENSOR_MODEL_PARALLEL_GROUP = group
@@ -292,7 +301,7 @@ def initialize_model_parallel(
         assert _POSITION_EMBEDDING_GROUP is None, 'position embedding group is already initialized'
         _PIPELINE_MODEL_PARALLEL_GROUP = []
         _PIPELINE_GLOBAL_RANKS = []
-        for ranks in parallel_group_config["pp"]:
+        for ranks in parallel_groups["pp"]:
             group = torch.distributed.new_group(ranks)
             if rank in ranks:
                 _PIPELINE_MODEL_PARALLEL_GROUP.append(group)
@@ -657,7 +666,6 @@ def initialize_model_parallel(
 
 def set_micro_batch_dp_dispatcher(graph: nx.DiGraph, graph_depth: dict, micro_batch_size: int):
     """For the given graph and the number of micro-batches, determine the flow of micro-batch data for stages."""
-    # Currently for pipeline + data parallel. TODO tensor parallel.
     stages = sorted(list(set(graph_depth.values())))
     stage_device_list = []
     for stage in stages:
@@ -666,7 +674,6 @@ def set_micro_batch_dp_dispatcher(graph: nx.DiGraph, graph_depth: dict, micro_ba
             if graph_depth[node] == stage:
                 ranks.append(node)
         stage_device_list.append(ranks)
-    print(f'stage_device_list={stage_device_list}', flush=True)
     # Mode 1: uniform sharding
     per_device_micro_batch_sizes = {}
     for stage, ranks in enumerate(stage_device_list):
@@ -678,7 +685,6 @@ def set_micro_batch_dp_dispatcher(graph: nx.DiGraph, graph_depth: dict, micro_ba
             per_device_micro_batch_sizes[stage][ranks[-1]] = micro_batch_size - (len(ranks) - 1) * rounded_bs
     
     # TODO Mode 2: manual sharding
-    
     # Set micro-batch numbers to edge weights
     for stage in per_device_micro_batch_sizes.keys():
         for rank, input_bs in per_device_micro_batch_sizes[stage].items():

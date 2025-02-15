@@ -6,6 +6,8 @@ set -x
 #     echo "usage:" $0 "exp_name model_name t p d gbs mbs nodelist"
 #     exit 1
 # fi
+export CPATH=/usr/include/python3.11:$CPATH
+export LD_LIBRARY_PATH=/usr/lib/python3.11:$LD_LIBRARY_PATH
 
 export MASTER_PORT=$(expr $RANDOM % 10000 + 10000)
 
@@ -22,15 +24,14 @@ export MASTER_PORT=$(expr $RANDOM % 10000 + 10000)
 
 export EXP_NAME="hetero-train"
 export MODEL_NAME="GPT-1.3B"
-export TENSOR_PARALLEL_SIZE=1
-export PIPELINE_PARALLEL_SIZE=2
-export DATA_PARALLEL_SIZE=1
-export GLOBAL_BATCH_SIZE=54
-export MICRO_BATCH_SIZE=9
-export NODELIST=octave
-export GPUS_PER_NODE=8
-export COMPRESS=0
-export LL="12 12"
+# export TENSOR_PARALLEL_SIZE=1
+# export PIPELINE_PARALLEL_SIZE=2
+# export DATA_PARALLEL_SIZE=1
+export GLOBAL_BATCH_SIZE=64
+export MICRO_BATCH_SIZE=8
+export NODELIST=octave,ja[1-4]
+export GPUS_PER_NODE=1
+export WORLD_SIZE=8
 
 export NUM_LAYERS=-1
 export HIDDEN_SIZE=-1
@@ -96,36 +97,36 @@ mkdir -p $PROFILER_LOG_PATH
 
 NNODES=$(scontrol show hostnames ${NODELIST} | wc -l)
 
-srun \
-    -A long \
-    -p long \
-    -K \
-    -N $NNODES \
-    -w $NODELIST \
-    --time 20:00 \
-    --job-name=$EXP_NAME \
-	--ntasks-per-node=$GPUS_PER_NODE \
-    --gres=gpu:$GPUS_PER_NODE \
-    --export=ALL \
-	bash pretrain.sh
 # srun \
 #     -A long \
 #     -p long \
 #     -K \
-#     -N 1 \
-#     -w octave \
+#     -N $NNODES \
+#     -w $NODELIST \
+#     --time 20:00 \
 #     --job-name=$EXP_NAME \
 # 	--ntasks-per-node=$GPUS_PER_NODE \
-#     --gres=gpu:a100:4 \
+#     --gres=gpu:$GPUS_PER_NODE \
 #     --export=ALL \
-# 	bash pretrain.sh : \
-#     -A long \
-#     -p long \
-#     -K \
-#     -N 1 \
-#     -w twills \
-#     --job-name=$EXP_NAME \
-#     --ntasks-per-node=$GPUS_PER_NODE \
-#     --gres=gpu:v100:2,gpu:a10:2 \
-#     --export=ALL \
-#     bash pretrain.sh
+# 	bash pretrain.sh
+srun \
+    -A long \
+    -p long \
+    -K \
+    -N 1 \
+    -w octave \
+    --job-name=$EXP_NAME \
+	--ntasks-per-node=4 \
+    --gres=gpu:a100:4 \
+    --export=ALL \
+	bash pretrain.sh : \
+    -A long \
+    -p long \
+    -K \
+    -N 4 \
+    -w ja[1-4] \
+    --job-name=$EXP_NAME \
+    --ntasks-per-node=1 \
+    --gres=gpu:v100:1 \
+    --export=ALL \
+    bash pretrain.sh
